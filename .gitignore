@@ -1,0 +1,15 @@
+# Output files
+cleaned_contacts.csv
+archived_contacts.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Scratch
+scripts/scratch/

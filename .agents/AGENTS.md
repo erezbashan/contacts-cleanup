@@ -1,0 +1,1 @@
+- Always read and follow the instructions in all files under .agents/rules/
