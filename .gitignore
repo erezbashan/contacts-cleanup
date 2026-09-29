@@ -14,3 +14,5 @@ venv/
 # Scratch
 scripts/scratch/
 contacts.csv
+*.tgz
+*.mbox
