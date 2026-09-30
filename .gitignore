@@ -18,3 +18,4 @@ contacts.csv
 *.mbox
 email_interactions.json
 cleaned_contacts_part*.csv
+other_contacts.csv
