@@ -16,3 +16,4 @@ scripts/scratch/
 contacts.csv
 *.tgz
 *.mbox
+email_interactions.json
