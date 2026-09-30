@@ -149,6 +149,23 @@ class UnionFind:
             self.parent[root_i] = root_j
 
 
+def are_similar_names(n1: str, n2: str) -> bool:
+    if not n1 or not n2:
+        return True
+    w1 = [w.lower() for w in re.findall(r"[\w]+", n1)]
+    w2 = [w.lower() for w in re.findall(r"[\w]+", n2)]
+    if sorted(w1) == sorted(w2):
+        return True
+    s1, s2 = set(w1), set(w2)
+    if s1.issubset(s2) or s2.issubset(s1):
+        return True
+    c1 = "".join(re.findall(r"[a-zA-Z]+", n1.lower()))
+    c2 = "".join(re.findall(r"[a-zA-Z]+", n2.lower()))
+    if c1 and c2 and (c1 == c2 or (len(c1) >= 5 and c1 in c2) or (len(c2) >= 5 and c2 in c1)):
+        return True
+    return False
+
+
 def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
     """
     Consolidate a cluster of duplicate/fragmented contact records into a single
@@ -192,6 +209,30 @@ def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
             best_ln = r.get("Last Name", "").strip()
             if best_fn or best_ln:
                 break
+
+    # Collect distinct substantive names across cluster for composite naming
+    # (e.g. Palag Miriami / פקח עירייה)
+    primary_display = f"{best_fn} {best_ln}".strip() or best_org
+    distinct_names = [primary_display] if primary_display else []
+
+    for _, r in records.iterrows():
+        fn_r = r.get("First Name", "").strip()
+        ln_r = r.get("Last Name", "").strip()
+        org_r = r.get("Organization Name", "").strip()
+        full_r = f"{fn_r} {ln_r}".strip()
+        candidate = full_r if (full_r and "@" not in full_r) else org_r
+
+        if candidate and not any(are_similar_names(candidate, existing) for existing in distinct_names):
+            distinct_names.append(candidate)
+
+    if len(distinct_names) > 1:
+        secondary_part = " / ".join(distinct_names[1:])
+        if best_ln:
+            best_ln = f"{best_ln} / {secondary_part}"
+        elif best_fn:
+            best_fn = f"{best_fn} / {secondary_part}"
+        else:
+            best_fn = " / ".join(distinct_names)
 
     # 2. Collect unique phones
     unique_phones: list[tuple[str, str]] = []  # (label, value)
@@ -304,19 +345,44 @@ def smart_deduplicate_contacts(
     N = len(all_df)
     uf = UnionFind(N)
 
-    # 1. Match by Phone Number (last 9 digits)
+    # Identify company switchboards / shared landlines (shared across 3+ distinct people)
+    phone_names: dict[str, set[str]] = {}
+    for i, r in all_df.iterrows():
+        fn = r.get("First Name", "").strip()
+        ln = r.get("Last Name", "").strip()
+        full = f"{fn} {ln}".strip()
+        if full and "@" not in full:
+            for c in [col for col in all_df.columns if PHONE_COLUMN_RE.match(col)]:
+                val = r[c]
+                if val:
+                    for raw in val.split(":::"):
+                        d = normalize_phone(raw)
+                        if len(d) >= 7:
+                            phone_names.setdefault(d[-9:], set()).add(full.lower())
+
+    switchboard_keys = {k for k, names in phone_names.items() if len(names) >= 3}
+    if switchboard_keys:
+        log.info(
+            "Excluding %d shared company switchboards/landlines from auto-merge to prevent cross-colleague merging",
+            len(switchboard_keys),
+        )
+
+    # 1. Match by Phone Number (last 9 digits, excluding switchboards)
     phone_map: dict[str, int] = {}
     for i, r in all_df.iterrows():
         for c in [col for col in all_df.columns if PHONE_COLUMN_RE.match(col)]:
             val = r[c]
             if val:
-                d = normalize_phone(val)
-                if len(d) >= 7:
-                    key = d[-9:]
-                    if key in phone_map:
-                        uf.union(i, phone_map[key])
-                    else:
-                        phone_map[key] = i
+                for raw in val.split(":::"):
+                    d = normalize_phone(raw)
+                    if len(d) >= 7:
+                        key = d[-9:]
+                        if key in switchboard_keys:
+                            continue
+                        if key in phone_map:
+                            uf.union(i, phone_map[key])
+                        else:
+                            phone_map[key] = i
 
     # 2. Match by Shared Email Address
     email_map: dict[str, int] = {}
