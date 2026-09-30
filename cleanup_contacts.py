@@ -425,6 +425,20 @@ def smart_deduplicate_contacts(
     else:
         all_df = df_main[cols].copy()
 
+    # Sanitize accidental self-email contamination in contacts of other people (e.g. legacy Yigal Petreanu card)
+    for col in [c for c in all_df.columns if EMAIL_COLUMN_RE.match(c)]:
+        for idx in range(len(all_df)):
+            val = str(all_df.at[idx, col])
+            if val and "erez.bashan@gmail.com" in val.lower():
+                fn = str(all_df.at[idx, "First Name"]).strip().lower()
+                ln = str(all_df.at[idx, "Last Name"]).strip().lower()
+                if "erez" not in fn and "bashan" not in ln:
+                    new_vals = [
+                        v.strip() for v in val.split(":::")
+                        if v.strip().lower() != "erez.bashan@gmail.com"
+                    ]
+                    all_df.at[idx, col] = " ::: ".join(new_vals)
+
     N = len(all_df)
     uf = UnionFind(N)
 
