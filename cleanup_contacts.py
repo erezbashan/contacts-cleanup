@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-Google Contacts Cleanup Script
-==============================
-Cross-references an exported Google Contacts CSV against:
-1. macOS WhatsApp Desktop SQLite databases (messages + calls)
-2. Google Takeout Gmail mbox archive (streaming directly without disk extraction)
+Google Contacts Cleanup & Smart Merge Script
+===========================================
+1. Consolidates & deduplicates contacts across:
+   - Main contacts (contacts.csv)
+   - Auto-generated contacts (other_contacts.csv from Google Contacts)
+   Resolves reversed names (First Last vs Last First), email-as-name entries,
+   shared mobile numbers, and multiple fragmented email addresses.
 
-Contacts with WhatsApp or Email activity within --years are written to
-cleaned_contacts.csv; the rest go to archived_contacts.csv.
-Both files are always written.
+2. Cross-references the consolidated contacts against:
+   - macOS WhatsApp Desktop (messages + calls)
+   - Gmail interaction history (via Google Takeout streamed without disk unpacking)
+
+3. Splits contacts into:
+   - cleaned_contacts.csv (active in the last N years)
+   - archived_contacts.csv (inactive, for Google Drive backup)
 
 Usage:
-    python cleanup_contacts.py contacts.csv               # uses 5-year default
+    python cleanup_contacts.py contacts.csv
+    python cleanup_contacts.py contacts.csv --other-contacts other_contacts.csv
     python cleanup_contacts.py contacts.csv --years 3
-    python cleanup_contacts.py contacts.csv --output-dir ./output
 """
 
 import argparse
@@ -58,10 +64,7 @@ CORE_DATA_EPOCH = datetime(2001, 1, 1)
 PHONE_COLUMN_RE = re.compile(r"^Phone \d+ - Value$")
 EMAIL_COLUMN_RE = re.compile(r"^E-mail \d+ - Value$")
 
-# Minimum number of digits required for suffix matching to avoid false positives.
 MIN_DIGITS_DEFAULT = 7
-
-# Year thresholds printed in the breakdown report
 BREAKDOWN_YEARS = [1, 2, 3, 5, 7, 10, 15, 20]
 
 logging.basicConfig(
@@ -89,12 +92,10 @@ def apple_ts_to_datetime(ts: float) -> datetime | None:
 
 
 def jid_to_digits(jid: str) -> str:
-    """Extract the phone number digits from a @s.whatsapp.net JID."""
     return re.sub(r"\D", "", jid.split("@")[0])
 
 
 def merge_into(result: dict[str, datetime], key: str, dt: datetime | None) -> None:
-    """Keep the latest date for each key (phone digits or email)."""
     if key and dt and (key not in result or dt > result[key]):
         result[key] = dt
 
@@ -122,16 +123,349 @@ def parse_email_date(date_str: str) -> datetime | None:
     return dt
 
 
+def normalize_phone(raw: str) -> str:
+    return re.sub(r"\D", "", str(raw))
+
+
+# ---------------------------------------------------------------------------
+# Smart Deduplication & Merging Engine
+# ---------------------------------------------------------------------------
+
+
+class UnionFind:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+
+    def find(self, i: int) -> int:
+        if self.parent[i] == i:
+            return i
+        self.parent[i] = self.find(self.parent[i])
+        return self.parent[i]
+
+    def union(self, i: int, j: int) -> None:
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            self.parent[root_i] = root_j
+
+
+def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
+    """
+    Consolidate a cluster of duplicate/fragmented contact records into a single
+    complete record.
+    """
+    # 1. Best Name Selection
+    # Prioritize main contacts over other_contacts, and proper First+Last over emails
+    best_fn, best_mn, best_ln = "", "", ""
+    best_org = ""
+    best_name_score = -1
+
+    for _, r in records.iterrows():
+        fn = r.get("First Name", "").strip()
+        mn = r.get("Middle Name", "").strip()
+        ln = r.get("Last Name", "").strip()
+        org = r.get("Organization Name", "").strip()
+        origin = r.get("_origin", "main")
+
+        full = f"{fn} {ln}".strip()
+        score = 0
+        if origin == "main":
+            score += 10
+        if fn and ln:
+            score += 10
+        elif full and "@" not in full:
+            score += 4
+        # Penalize ALL-CAPS email-like names
+        if "@" in full or (full.isupper() and len(full) > 4):
+            score -= 5
+
+        if score > best_name_score and (fn or ln or full):
+            best_name_score = score
+            best_fn, best_mn, best_ln = fn, mn, ln
+        if org and not best_org:
+            best_org = org
+
+    # If no separate first/last found, fall back to whatever non-empty is available
+    if not best_fn and not best_ln:
+        for _, r in records.iterrows():
+            best_fn = r.get("First Name", "").strip()
+            best_ln = r.get("Last Name", "").strip()
+            if best_fn or best_ln:
+                break
+
+    # 2. Collect unique phones
+    unique_phones: list[tuple[str, str]] = []  # (label, value)
+    seen_phone_digits = set()
+    for _, r in records.iterrows():
+        for i in range(1, 10):
+            raw_val = r.get(f"Phone {i} - Value", "").strip()
+            lbl = r.get(f"Phone {i} - Label", "").strip() or "Mobile"
+            for val in raw_val.split(":::"):
+                val = val.strip()
+                if val:
+                    digits = normalize_phone(val)
+                    key = digits[-9:] if len(digits) >= 7 else digits
+                    if key and key not in seen_phone_digits:
+                        seen_phone_digits.add(key)
+                        unique_phones.append((lbl, val))
+
+    # 3. Collect unique emails
+    unique_emails: list[tuple[str, str]] = []  # (label, value)
+    seen_emails = set()
+    for _, r in records.iterrows():
+        for i in range(1, 10):
+            raw_val = r.get(f"E-mail {i} - Value", "").strip()
+            lbl = r.get(f"E-mail {i} - Label", "").strip() or "Home"
+            for val in raw_val.split(":::"):
+                val = val.strip()
+                if val and "@" in val:
+                    norm = val.lower()
+                    if norm not in seen_emails:
+                        seen_emails.add(norm)
+                        unique_emails.append((lbl, val))
+
+    # 4. Notes, Birthday, Labels
+    merged_notes = []
+    best_bday = ""
+    merged_labels = set()
+
+    for _, r in records.iterrows():
+        notes = r.get("Notes", "").strip()
+        if notes and notes not in merged_notes:
+            merged_notes.append(notes)
+        bday = r.get("Birthday", "").strip()
+        if bday and not best_bday:
+            best_bday = bday
+        labels_str = r.get("Labels", "").strip()
+        if labels_str:
+            for lbl in labels_str.split(":::"):
+                lbl = lbl.strip()
+                if lbl and lbl != "* Other Contacts":
+                    merged_labels.add(lbl)
+
+    # Build the merged row dictionary
+    merged = {c: "" for c in all_cols}
+    merged["First Name"] = best_fn
+    merged["Middle Name"] = best_mn
+    merged["Last Name"] = best_ln
+    merged["Organization Name"] = best_org
+    merged["Birthday"] = best_bday
+    merged["Notes"] = " | ".join(merged_notes)
+    merged["Labels"] = " ::: ".join(sorted(merged_labels)) if merged_labels else "* myContacts"
+
+    # Fill phones
+    for idx, (lbl, val) in enumerate(unique_phones[:10], 1):
+        merged[f"Phone {idx} - Label"] = lbl
+        merged[f"Phone {idx} - Value"] = val
+
+    # Fill emails
+    for idx, (lbl, val) in enumerate(unique_emails[:10], 1):
+        merged[f"E-mail {idx} - Label"] = lbl
+        merged[f"E-mail {idx} - Value"] = val
+
+    return merged
+
+
+def smart_deduplicate_contacts(
+    main_csv: str, other_csv: str | None
+) -> tuple[pd.DataFrame, int, int]:
+    """
+    Load main and other contacts, cluster duplicates, and merge them.
+    Returns (consolidated_df, total_raw_count, total_clusters_merged).
+    """
+    df_main = pd.read_csv(main_csv, dtype=str, keep_default_na=False)
+    df_main["_origin"] = "main"
+
+    if other_csv and os.path.exists(other_csv):
+        df_other = pd.read_csv(other_csv, dtype=str, keep_default_na=False)
+        df_other["_origin"] = "other"
+        log.info(
+            "Merging main contacts (%d) with other_contacts (%d)...",
+            len(df_main),
+            len(df_other),
+        )
+    else:
+        df_other = pd.DataFrame()
+        log.info("Deduplicating main contacts (%d)...", len(df_main))
+
+    cols = list(df_main.columns)
+    if not df_other.empty:
+        for c in cols:
+            if c not in df_other.columns:
+                df_other[c] = ""
+        for c in df_other.columns:
+            if c not in cols:
+                df_main[c] = ""
+                cols.append(c)
+        all_df = pd.concat([df_main[cols], df_other[cols]], ignore_index=True)
+    else:
+        all_df = df_main[cols].copy()
+
+    N = len(all_df)
+    uf = UnionFind(N)
+
+    # 1. Match by Phone Number (last 9 digits)
+    phone_map: dict[str, int] = {}
+    for i, r in all_df.iterrows():
+        for c in [col for col in all_df.columns if PHONE_COLUMN_RE.match(col)]:
+            val = r[c]
+            if val:
+                d = normalize_phone(val)
+                if len(d) >= 7:
+                    key = d[-9:]
+                    if key in phone_map:
+                        uf.union(i, phone_map[key])
+                    else:
+                        phone_map[key] = i
+
+    # 2. Match by Shared Email Address
+    email_map: dict[str, int] = {}
+    for i, r in all_df.iterrows():
+        for c in [col for col in all_df.columns if EMAIL_COLUMN_RE.match(col)]:
+            val = r[c]
+            if val and "@" in val:
+                key = val.strip().lower()
+                if key in email_map:
+                    uf.union(i, email_map[key])
+                else:
+                    email_map[key] = i
+
+    # 3. Match by Normalized & Reversed Names
+    name_map: dict[tuple, int] = {}
+    for i, r in all_df.iterrows():
+        fn = r.get("First Name", "").strip()
+        ln = r.get("Last Name", "").strip()
+        words = re.findall(r"[\w]+", f"{fn} {ln}".lower())
+        if len(words) >= 2 and sum(len(w) for w in words) >= 5:
+            key = tuple(sorted(words))
+            if key in name_map:
+                uf.union(i, name_map[key])
+            else:
+                name_map[key] = i
+
+    # 4. Match Email-Username to Person Full Name
+    # (e.g. yifat.meidav@elbitsystems.com -> Yifat Meidav)
+    name_alphanumeric_map: dict[str, list[int]] = {}
+    for i, r in all_df.iterrows():
+        fn = r.get("First Name", "").strip()
+        ln = r.get("Last Name", "").strip()
+        if fn and ln:
+            clean = "".join(re.findall(r"[a-zA-Z]+", f"{fn}{ln}".lower()))
+            if len(clean) >= 6:
+                name_alphanumeric_map.setdefault(clean, []).append(i)
+
+    for i, r in all_df.iterrows():
+        for c in [col for col in all_df.columns if EMAIL_COLUMN_RE.match(col)]:
+            val = r[c]
+            if val and "@" in val:
+                user = val.split("@")[0].lower()
+                clean_user = "".join(re.findall(r"[a-zA-Z]+", user))
+                if len(clean_user) >= 6 and clean_user in name_alphanumeric_map:
+                    for target_i in name_alphanumeric_map[clean_user]:
+                        uf.union(i, target_i)
+
+    # Group records by root parent
+    clusters: dict[int, list[int]] = {}
+    for i in range(N):
+        clusters.setdefault(uf.find(i), []).append(i)
+
+    clean_cols = [c for c in cols if not c.startswith("_")]
+    # Ensure standard phone and email slots exist up to 5
+    for i in range(1, 6):
+        for prefix in ["Phone", "E-mail"]:
+            for suffix in ["Label", "Value"]:
+                col_name = f"{prefix} {i} - {suffix}"
+                if col_name not in clean_cols:
+                    clean_cols.append(col_name)
+
+    merged_rows = []
+    multi_clusters_count = 0
+    merge_log_lines = [
+        "=" * 80 + "\n",
+        "CONTACTS SMART MERGE AUDIT LOG\n",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+        f"Consolidated {N} raw records into {len(clusters)} unique contacts\n",
+        "=" * 80 + "\n\n",
+    ]
+
+    for root_id, indices in clusters.items():
+        records = all_df.iloc[indices]
+        merged_row = merge_contact_cluster(records, clean_cols)
+        merged_rows.append(merged_row)
+
+        if len(indices) > 1:
+            multi_clusters_count += 1
+            name = (
+                f"{merged_row['First Name']} {merged_row['Last Name']}".strip()
+                or merged_row["Organization Name"]
+                or "(no name)"
+            )
+            merge_log_lines.append("-" * 80 + "\n")
+            merge_log_lines.append(
+                f"MERGED CLUSTER #{multi_clusters_count}: '{name}' ({len(indices)} records combined)\n"
+            )
+            merge_log_lines.append("  Original records:\n")
+            for idx in indices:
+                rec = all_df.iloc[idx]
+                orig = rec.get("_origin", "main")
+                r_fn = rec.get("First Name", "").strip()
+                r_ln = rec.get("Last Name", "").strip()
+                r_org = rec.get("Organization Name", "").strip()
+                r_name = f"{r_fn} {r_ln}".strip() or r_org or "(no name)"
+                r_phones = [
+                    rec.get(f"Phone {k} - Value", "").strip()
+                    for k in range(1, 5)
+                    if rec.get(f"Phone {k} - Value", "").strip()
+                ]
+                r_emails = [
+                    rec.get(f"E-mail {k} - Value", "").strip()
+                    for k in range(1, 5)
+                    if rec.get(f"E-mail {k} - Value", "").strip()
+                ]
+                merge_log_lines.append(
+                    f"    * [{orig:5s}] Name: '{r_name}' | Phones: {r_phones} | Emails: {r_emails}\n"
+                )
+
+            m_phones = [
+                merged_row.get(f"Phone {k} - Value", "")
+                for k in range(1, 10)
+                if merged_row.get(f"Phone {k} - Value", "")
+            ]
+            m_emails = [
+                merged_row.get(f"E-mail {k} - Value", "")
+                for k in range(1, 10)
+                if merged_row.get(f"E-mail {k} - Value", "")
+            ]
+            merge_log_lines.append("  Resulting consolidated contact:\n")
+            merge_log_lines.append(
+                f"    Name:   {name}\n    Phones: {m_phones}\n    Emails: {m_emails}\n\n"
+            )
+
+    log_path = "merged_contacts_log.txt"
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.writelines(merge_log_lines)
+        log.info("Wrote detailed merge audit log to %s (%d clusters)", log_path, multi_clusters_count)
+    except Exception as e:
+        log.warning("Could not write merge audit log: %s", e)
+
+    consolidated_df = pd.DataFrame(merged_rows).fillna("")
+    consolidated_df = consolidated_df.astype(str)
+    log.info(
+        "Consolidation complete: %d raw records -> %d unique contacts (%d duplicate clusters merged)",
+        N,
+        len(consolidated_df),
+        multi_clusters_count,
+    )
+    return consolidated_df, N, multi_clusters_count
+
+
 # ---------------------------------------------------------------------------
 # WhatsApp Messages Extraction (ChatStorage.sqlite)
 # ---------------------------------------------------------------------------
 
 
 def extract_from_messages(chat_db_path: str) -> tuple[dict[str, datetime], dict[str, str]]:
-    """
-    Extract phone numbers + latest interaction date from WhatsApp messages.
-    Returns (phone_number -> latest_date, lid -> phone_digits).
-    """
     if not Path(chat_db_path).exists():
         log.error("WhatsApp ChatStorage not found at: %s", chat_db_path)
         sys.exit(1)
@@ -169,7 +503,6 @@ def extract_from_messages(chat_db_path: str) -> tuple[dict[str, datetime], dict[
 
     df = pd.read_sql_query(query, conn)
 
-    # Build a LID -> phone mapping from ZWACHATSESSION for use in call extraction
     lid_map_df = pd.read_sql_query(
         """
         SELECT ZCONTACTJID AS lid, ZCONTACTIDENTIFIER AS phone
@@ -207,7 +540,6 @@ def extract_from_messages(chat_db_path: str) -> tuple[dict[str, datetime], dict[
 def extract_from_calls(
     call_db_path: str, lid_to_digits: dict[str, str]
 ) -> dict[str, datetime]:
-    """Extract phone numbers + latest call date from WhatsApp CallHistory.sqlite."""
     if not Path(call_db_path).exists():
         log.warning("WhatsApp CallHistory not found at: %s — skipping calls", call_db_path)
         return {}
@@ -255,7 +587,6 @@ def extract_from_calls(
 def extract_all_whatsapp_numbers(
     chat_db_path: str, call_db_path: str
 ) -> dict[str, datetime]:
-    """Merge message and call interaction data into a single number -> date map."""
     log.info("Extracting WhatsApp interaction data...")
     message_dates, lid_to_digits = extract_from_messages(chat_db_path)
     call_dates = extract_from_calls(call_db_path, lid_to_digits)
@@ -269,16 +600,14 @@ def extract_all_whatsapp_numbers(
 
 
 # ---------------------------------------------------------------------------
-# Google Takeout Email Extraction (Streaming mbox directly from tgz)
+# Google Takeout Email Extraction
 # ---------------------------------------------------------------------------
 
 
 def find_takeout_archive() -> str | None:
-    """Find any large takeout tgz or mbox file in the current directory."""
     candidates = glob.glob("takeout-*.tgz") + glob.glob("takeout-*.tar.gz") + glob.glob("*.mbox")
     valid = [c for c in candidates if os.path.getsize(c) > 10 * 1024 * 1024]
     if valid:
-        # Pick the largest archive
         return max(valid, key=os.path.getsize)
     return None
 
@@ -289,10 +618,6 @@ def extract_email_interactions(
     cache_path: str = EMAIL_CACHE_FILE,
     rebuild_cache: bool = False,
 ) -> dict[str, datetime]:
-    """
-    Extract email interaction dates from a cached JSON file or by streaming
-    a Google Takeout tgz/mbox archive directly without unpacking to disk.
-    """
     if not rebuild_cache and os.path.exists(cache_path):
         log.info("Loading email interaction history from cache: %s", cache_path)
         try:
@@ -315,13 +640,7 @@ def extract_email_interactions(
         archive_size_gb,
     )
 
-    if archive_path.endswith((".tgz", ".tar.gz")):
-        cmd = ["tar", "-xzOf", archive_path]
-    elif archive_path.endswith(".mbox"):
-        cmd = ["cat", archive_path]
-    else:
-        cmd = ["tar", "-xzOf", archive_path]
-
+    cmd = ["tar", "-xzOf", archive_path] if archive_path.endswith((".tgz", ".tar.gz")) else ["cat", archive_path]
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -424,18 +743,13 @@ def extract_email_interactions(
 
 
 # ---------------------------------------------------------------------------
-# Contact Matching
+# Matching & Classification
 # ---------------------------------------------------------------------------
-
-
-def normalize_phone(raw: str) -> str:
-    return re.sub(r"\D", "", str(raw))
 
 
 def find_latest_phone_interaction(
     contact_digits: str, number_dates: dict[str, datetime], min_digits: int
 ) -> datetime | None:
-    """Find the latest interaction date for a phone number using suffix matching."""
     if not contact_digits or len(contact_digits) < min_digits:
         return None
 
@@ -451,24 +765,16 @@ def find_latest_phone_interaction(
 
 
 def classify_contacts(
-    csv_path: str,
+    contacts: pd.DataFrame,
     number_dates: dict[str, datetime],
     email_dates: dict[str, datetime],
     min_digits: int,
     years: int,
 ) -> pd.DataFrame:
-    """
-    Read Google Contacts CSV and classify each contact based on phone and email
-    interactions.
-    """
-    contacts = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-    log.info("Loaded %d contacts from %s", len(contacts), csv_path)
-
     phone_cols = [c for c in contacts.columns if PHONE_COLUMN_RE.match(c)]
     email_cols = [c for c in contacts.columns if EMAIL_COLUMN_RE.match(c)]
 
-    log.info("Matching against %d phone columns: %s", len(phone_cols), phone_cols)
-    log.info("Matching against %d email columns: %s", len(email_cols), email_cols)
+    log.info("Matching against %d phone columns and %d email columns...", len(phone_cols), len(email_cols))
 
     cutoff = datetime.now() - timedelta(days=years * 365)
 
@@ -495,7 +801,6 @@ def classify_contacts(
                 if dt is not None and (best_email is None or dt > best_email):
                     best_email = dt
 
-        # Combine
         combined_dates = [d for d in [best_phone, best_email] if d is not None]
         best_dt = max(combined_dates) if combined_dates else None
         latest_dates.append(best_dt)
@@ -535,7 +840,7 @@ def print_year_breakdown(contacts: pd.DataFrame) -> None:
     log.info("=" * 65)
     log.info("INTERACTION THRESHOLD BREAKDOWN")
     log.info("=" * 65)
-    log.info("  Total contacts:                 %d", total)
+    log.info("  Total consolidated contacts:    %d", total)
     log.info("  With any active interaction:    %d", has_match)
     log.info("  No interaction (archived):      %d", no_match)
     log.info("")
@@ -554,35 +859,21 @@ def print_year_breakdown(contacts: pd.DataFrame) -> None:
 
     log.info("=" * 65)
 
-    year_counts = (
-        contacts[contacts["_interaction_year"].notna()]
-        .groupby("_interaction_year")
-        .size()
-        .sort_index()
-    )
-    if not year_counts.empty:
-        log.info("")
-        log.info("Latest interaction year distribution:")
-        max_count = year_counts.max()
-        for year, count in year_counts.items():
-            bar = "█" * int(40 * count / max_count)
-            log.info("  %d │ %4d  %s", int(year), count, bar)
-        log.info("")
-
 
 def print_archive_sample(archive: pd.DataFrame, n: int = 20) -> None:
     if archive.empty:
         return
-    name_col = next(
-        (c for c in ["Name", "First Name"] if c in archive.columns),
-        archive.columns[0],
-    )
     log.info("Sample contacts being archived (first %d of %d):", min(n, len(archive)), len(archive))
     for _, row in archive.head(n).iterrows():
-        name = row.get(name_col, "").strip() or "(no name)"
+        fn = row.get("First Name", "").strip()
+        ln = row.get("Last Name", "").strip()
+        org = row.get("Organization Name", "").strip()
+        name = f"{fn} {ln}".strip() or org or "(no name)"
         year = row["_interaction_year"]
         tag = f"last seen {int(year)}" if pd.notna(year) else "no interaction"
-        log.info("  - %-38s  [%s]", name, tag)
+        p = row.get("Phone 1 - Value", "").strip()
+        e = row.get("E-mail 1 - Value", "").strip()
+        log.info("  - %-35s  [%s]  %s", name, tag, p or e)
 
 
 # ---------------------------------------------------------------------------
@@ -592,14 +883,19 @@ def print_archive_sample(archive: pd.DataFrame, n: int = 20) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Clean up Google Contacts using WhatsApp (messages + calls) and Gmail interactions."
+        description="Deduplicate, merge, and clean Google Contacts using WhatsApp and Gmail interactions."
     )
-    parser.add_argument("csv", help="Path to exported Google Contacts CSV file.")
+    parser.add_argument("csv", help="Path to main Google Contacts CSV file.")
+    parser.add_argument(
+        "--other-contacts",
+        default="other_contacts.csv",
+        help="Path to other_contacts.csv (auto-detected if present).",
+    )
     parser.add_argument(
         "--years",
         type=int,
         default=5,
-        help="Number of years of interaction history to keep (default: 5).",
+        help="Years of interaction history to keep (default: 5).",
     )
     parser.add_argument(
         "--min-digits",
@@ -625,7 +921,7 @@ def main() -> None:
     parser.add_argument(
         "--email-cache",
         default=EMAIL_CACHE_FILE,
-        help=f"Path to cache file for extracted email dates (default: {EMAIL_CACHE_FILE}).",
+        help=f"Path to cache file for email interaction dates (default: {EMAIL_CACHE_FILE}).",
     )
     parser.add_argument(
         "--rebuild-email-cache",
@@ -635,24 +931,27 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         default=".",
-        help="Directory for output CSVs (default: current directory).",
+        help="Directory for output CSV files.",
     )
 
     args = parser.parse_args()
 
-    # 1. Read contacts to gather all target emails for fast scanning
-    raw_contacts = pd.read_csv(args.csv, dtype=str, keep_default_na=False)
+    # Step 1: Smart Deduplication & Merging
+    other_file = args.other_contacts if (args.other_contacts and os.path.exists(args.other_contacts)) else None
+    contacts, total_raw, clusters_merged = smart_deduplicate_contacts(args.csv, other_file)
+
+    # Step 2: Extract all target emails from consolidated contacts
     target_emails: set[str] = set()
-    for col in [c for c in raw_contacts.columns if EMAIL_COLUMN_RE.match(c)]:
-        for val in raw_contacts[col]:
+    for col in [c for c in contacts.columns if EMAIL_COLUMN_RE.match(c)]:
+        for val in contacts[col]:
             if val and "@" in val:
                 target_emails.add(val.strip().lower())
-    log.info("Found %d unique email addresses to cross-reference across contacts", len(target_emails))
+    log.info("Total unique emails across consolidated contacts: %d", len(target_emails))
 
-    # 2. Extract WhatsApp messages + calls
+    # Step 3: Extract WhatsApp interactions
     number_dates = extract_all_whatsapp_numbers(args.whatsapp_db, args.call_db)
 
-    # 3. Extract Email interactions
+    # Step 4: Extract Email interactions
     takeout_path = args.takeout_archive or find_takeout_archive()
     email_dates = extract_email_interactions(
         takeout_path,
@@ -661,20 +960,19 @@ def main() -> None:
         rebuild_cache=args.rebuild_email_cache,
     )
 
-    # 4. Classify contacts
+    # Step 5: Classify Contacts (5-Year Active Window)
     contacts = classify_contacts(
-        args.csv, number_dates, email_dates, args.min_digits, args.years
+        contacts, number_dates, email_dates, args.min_digits, args.years
     )
 
     keep = contacts[contacts["_keep"]]
     archive = contacts[~contacts["_keep"]]
 
-    # 5. Reporting
+    # Step 6: Reporting
     print_year_breakdown(contacts)
 
-    # Source breakdown of kept contacts
     source_counts = keep["_source"].value_counts().to_dict()
-    log.info("Kept contacts breakdown (--years %d):", args.years)
+    log.info("Consolidated contacts retention (--years %d):", args.years)
     log.info("  Total KEPT:       %d contacts (%.1f%%)", len(keep), 100 * len(keep) / len(contacts))
     log.info("    via WhatsApp:   %d", source_counts.get("whatsapp", 0))
     log.info("    via Email:      %d", source_counts.get("email", 0))
@@ -684,7 +982,7 @@ def main() -> None:
 
     print_archive_sample(archive)
 
-    # 6. Write output files
+    # Step 7: Write Output Files
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -692,19 +990,28 @@ def main() -> None:
     cleaned_path = out_dir / "cleaned_contacts.csv"
     archived_path = out_dir / "archived_contacts.csv"
 
-    keep.drop(columns=internal_cols).to_csv(cleaned_path, index=False)
-    archive.drop(columns=internal_cols).to_csv(archived_path, index=False)
+    keep_out = keep.drop(columns=internal_cols)
+    archive_out = archive.drop(columns=internal_cols)
+
+    keep_out.to_csv(cleaned_path, index=False)
+    archive_out.to_csv(archived_path, index=False)
+
+    # Also generate split batches for convenient web import
+    mid = len(keep_out) // 2
+    keep_out.iloc[:mid].to_csv(out_dir / "cleaned_contacts_part1.csv", index=False)
+    keep_out.iloc[mid:].to_csv(out_dir / "cleaned_contacts_part2.csv", index=False)
 
     log.info("")
     log.info("Files written:")
-    log.info("  %s  (%d contacts to re-import into Google)", cleaned_path, len(keep))
-    log.info("  %s  (%d contacts — upload to Drive as backup)", archived_path, len(archive))
+    log.info("  %s  (%d clean, deduplicated contacts)", cleaned_path, len(keep_out))
+    log.info("  %s  (%d archived contacts)", archived_path, len(archive_out))
+    log.info("  cleaned_contacts_part1.csv (%d contacts)", len(keep_out.iloc[:mid]))
+    log.info("  cleaned_contacts_part2.csv (%d contacts)", len(keep_out.iloc[mid:]))
     log.info("")
     log.info("NEXT STEPS:")
-    log.info("  1. Review archived_contacts.csv to confirm no important contacts are missed")
-    log.info("  2. Upload archived_contacts.csv to Google Drive for safekeeping")
-    log.info("  3. contacts.google.com -> select all -> delete (held in Trash for 30 days)")
-    log.info("  4. contacts.google.com -> Import -> cleaned_contacts.csv")
+    log.info("  1. Upload archived_contacts.csv to Google Drive for safekeeping")
+    log.info("  2. In Google Contacts -> Select all -> Delete (in Trash for 30 days)")
+    log.info("  3. Import cleaned_contacts.csv (or part1 and part2)")
 
 
 if __name__ == "__main__":
