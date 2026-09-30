@@ -149,8 +149,68 @@ class UnionFind:
             self.parent[root_i] = root_j
 
 
+def to_consonant_classes(s: str, is_heb: bool = False) -> str:
+    s = s.lower()
+    if not is_heb:
+        s = re.sub(r"tz|ts", "z", s)
+        s = re.sub(r"ch|kh", "k", s)
+        s = re.sub(r"sh", "s", s)
+    HEB_MAP = {
+        'ב': '1', 'פ': '1', 'ף': '1',
+        'ג': '2', 'כ': '2', 'ך': '2', 'ק': '2', 'ח': '2',
+        'ד': '3', 'ט': '3', 'ת': '3',
+        'ל': '4',
+        'מ': '5', 'ם': '5', 'נ': '5', 'ן': '5',
+        'ר': '6',
+        'ז': '7', 'ס': '7', 'צ': '7', 'ץ': '7', 'ש': '7',
+    }
+    ENG_MAP = {
+        'b': '1', 'v': '1', 'f': '1', 'p': '1', 'w': '1',
+        'g': '2', 'k': '2', 'q': '2', 'c': '2', 'h': '2',
+        'd': '3', 't': '3',
+        'l': '4',
+        'm': '5', 'n': '5',
+        'r': '6',
+        'z': '7', 's': '7', 'x': '7',
+    }
+    mapping = HEB_MAP if is_heb else ENG_MAP
+    res = []
+    for ch in s:
+        code = mapping.get(ch, '')
+        if code and (not res or res[-1] != code):
+            res.append(code)
+    return ''.join(res)
+
+
+def is_hebrew_english_equivalent(name1: str, name2: str) -> bool:
+    has_heb1 = any('\u0590' <= ch <= '\u05FF' for ch in name1)
+    has_heb2 = any('\u0590' <= ch <= '\u05FF' for ch in name2)
+    if (has_heb1 and not has_heb2) or (has_heb2 and not has_heb1):
+        heb = name1 if has_heb1 else name2
+        eng = name2 if has_heb1 else name1
+        sk_eng = to_consonant_classes(eng, is_heb=False)
+        sk_heb = to_consonant_classes(heb, is_heb=True)
+        if sk_eng == sk_heb and len(sk_eng) >= 3:
+            return True
+        w_eng = [w for w in re.findall(r'[a-zA-Z]+', eng)]
+        w_heb = [w for w in re.findall(r'[\u0590-\u05FF]+', heb)]
+        if len(w_eng) == len(w_heb) and len(w_eng) >= 2:
+            all_match = True
+            for we, wh in zip(w_eng, w_heb):
+                se = to_consonant_classes(we, is_heb=False)
+                sh = to_consonant_classes(wh, is_heb=True)
+                if not (se == sh or (len(se) >= 2 and se in sh) or (len(sh) >= 2 and sh in se)):
+                    all_match = False
+                    break
+            if all_match:
+                return True
+    return False
+
+
 def are_similar_names(n1: str, n2: str) -> bool:
     if not n1 or not n2:
+        return True
+    if is_hebrew_english_equivalent(n1, n2):
         return True
     w1 = [w.lower() for w in re.findall(r"[\w]+", n1)]
     w2 = [w.lower() for w in re.findall(r"[\w]+", n2)]
@@ -211,7 +271,6 @@ def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
                 break
 
     # Collect distinct substantive names across cluster for composite naming
-    # (e.g. Palag Miriami / פקח עירייה)
     primary_display = f"{best_fn} {best_ln}".strip() or best_org
     distinct_names = [primary_display] if primary_display else []
 
@@ -221,11 +280,35 @@ def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
         org_r = r.get("Organization Name", "").strip()
         full_r = f"{fn_r} {ln_r}".strip()
         candidate = full_r if (full_r and "@" not in full_r) else org_r
+        if not candidate:
+            continue
 
-        if candidate and not any(are_similar_names(candidate, existing) for existing in distinct_names):
+        # If candidate is a Hebrew-English transliteration equivalent of an existing name:
+        # Keep ONLY the English version (e.g. Adi Perl instead of Adi Perl / עדי פרל)
+        handled = False
+        for idx, existing in enumerate(distinct_names):
+            if is_hebrew_english_equivalent(existing, candidate):
+                cand_has_heb = any('\u0590' <= ch <= '\u05FF' for ch in candidate)
+                if not cand_has_heb:  # candidate is English, existing was Hebrew
+                    distinct_names[idx] = candidate
+                handled = True
+                break
+
+        if handled:
+            continue
+
+        if not any(are_similar_names(candidate, existing) for existing in distinct_names):
             distinct_names.append(candidate)
 
-    if len(distinct_names) > 1:
+    if len(distinct_names) == 1:
+        # If Hebrew name was replaced by English name, update best_fn and best_ln accordingly
+        only_name = distinct_names[0]
+        parts = only_name.split(None, 1)
+        if len(parts) == 2:
+            best_fn, best_ln = parts[0], parts[1]
+        else:
+            best_fn, best_ln = only_name, ""
+    elif len(distinct_names) > 1:
         secondary_part = " / ".join(distinct_names[1:])
         if best_ln:
             best_ln = f"{best_ln} / {secondary_part}"
@@ -367,7 +450,39 @@ def smart_deduplicate_contacts(
             len(switchboard_keys),
         )
 
-    # 1. Match by Phone Number (last 9 digits, excluding switchboards)
+    def can_merge_by_phone(r1: pd.Series, r2: pd.Series) -> bool:
+        # If they share an email address, definitely same person
+        e1 = {r1[c].strip().lower() for c in r1.index if EMAIL_COLUMN_RE.match(c) and r1[c] and "@" in r1[c]}
+        e2 = {r2[c].strip().lower() for c in r2.index if EMAIL_COLUMN_RE.match(c) and r2[c] and "@" in r2[c]}
+        if e1 and e2 and (e1 & e2):
+            return True
+
+        fn1, ln1 = r1.get("First Name", "").strip(), r1.get("Last Name", "").strip()
+        fn2, ln2 = r2.get("First Name", "").strip(), r2.get("Last Name", "").strip()
+        full1 = f"{fn1} {ln1}".strip()
+        full2 = f"{fn2} {ln2}".strip()
+
+        # If one record has NO personal name (e.g. only org/role title or empty), merging is safe
+        if (not full1 or "@" in full1) or (not full2 or "@" in full2):
+            return True
+
+        # Both have personal names. Require commonality to merge by phone:
+        w1 = [w.lower() for w in re.findall(r"[\w]+", full1)]
+        w2 = [w.lower() for w in re.findall(r"[\w]+", full2)]
+        if sorted(w1) == sorted(w2):
+            return True
+
+        s1, s2 = set(w1), set(w2)
+        if s1.issubset(s2) or s2.issubset(s1):
+            return True
+
+        if is_hebrew_english_equivalent(full1, full2):
+            return True
+
+        # Distinct personal names with nothing in common -> Refrain from merging!
+        return False
+
+    # 1. Match by Phone Number (last 9 digits, excluding switchboards and distinct names)
     phone_map: dict[str, int] = {}
     for i, r in all_df.iterrows():
         for c in [col for col in all_df.columns if PHONE_COLUMN_RE.match(col)]:
@@ -380,7 +495,9 @@ def smart_deduplicate_contacts(
                         if key in switchboard_keys:
                             continue
                         if key in phone_map:
-                            uf.union(i, phone_map[key])
+                            target_i = phone_map[key]
+                            if can_merge_by_phone(r, all_df.iloc[target_i]):
+                                uf.union(i, target_i)
                         else:
                             phone_map[key] = i
 
@@ -445,85 +562,27 @@ def smart_deduplicate_contacts(
                     clean_cols.append(col_name)
 
     merged_rows = []
+    cluster_indices_list = []
     multi_clusters_count = 0
-    merge_log_lines = [
-        "=" * 80 + "\n",
-        "CONTACTS SMART MERGE AUDIT LOG\n",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
-        f"Consolidated {N} raw records into {len(clusters)} unique contacts\n",
-        "=" * 80 + "\n\n",
-    ]
 
     for root_id, indices in clusters.items():
         records = all_df.iloc[indices]
         merged_row = merge_contact_cluster(records, clean_cols)
         merged_rows.append(merged_row)
-
+        cluster_indices_list.append(indices)
         if len(indices) > 1:
             multi_clusters_count += 1
-            name = (
-                f"{merged_row['First Name']} {merged_row['Last Name']}".strip()
-                or merged_row["Organization Name"]
-                or "(no name)"
-            )
-            merge_log_lines.append("-" * 80 + "\n")
-            merge_log_lines.append(
-                f"MERGED CLUSTER #{multi_clusters_count}: '{name}' ({len(indices)} records combined)\n"
-            )
-            merge_log_lines.append("  Original records:\n")
-            for idx in indices:
-                rec = all_df.iloc[idx]
-                orig = rec.get("_origin", "main")
-                r_fn = rec.get("First Name", "").strip()
-                r_ln = rec.get("Last Name", "").strip()
-                r_org = rec.get("Organization Name", "").strip()
-                r_name = f"{r_fn} {r_ln}".strip() or r_org or "(no name)"
-                r_phones = [
-                    rec.get(f"Phone {k} - Value", "").strip()
-                    for k in range(1, 5)
-                    if rec.get(f"Phone {k} - Value", "").strip()
-                ]
-                r_emails = [
-                    rec.get(f"E-mail {k} - Value", "").strip()
-                    for k in range(1, 5)
-                    if rec.get(f"E-mail {k} - Value", "").strip()
-                ]
-                merge_log_lines.append(
-                    f"    * [{orig:5s}] Name: '{r_name}' | Phones: {r_phones} | Emails: {r_emails}\n"
-                )
-
-            m_phones = [
-                merged_row.get(f"Phone {k} - Value", "")
-                for k in range(1, 10)
-                if merged_row.get(f"Phone {k} - Value", "")
-            ]
-            m_emails = [
-                merged_row.get(f"E-mail {k} - Value", "")
-                for k in range(1, 10)
-                if merged_row.get(f"E-mail {k} - Value", "")
-            ]
-            merge_log_lines.append("  Resulting consolidated contact:\n")
-            merge_log_lines.append(
-                f"    Name:   {name}\n    Phones: {m_phones}\n    Emails: {m_emails}\n\n"
-            )
-
-    log_path = "merged_contacts_log.txt"
-    try:
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.writelines(merge_log_lines)
-        log.info("Wrote detailed merge audit log to %s (%d clusters)", log_path, multi_clusters_count)
-    except Exception as e:
-        log.warning("Could not write merge audit log: %s", e)
 
     consolidated_df = pd.DataFrame(merged_rows).fillna("")
     consolidated_df = consolidated_df.astype(str)
+    consolidated_df["_cluster_indices"] = cluster_indices_list
     log.info(
         "Consolidation complete: %d raw records -> %d unique contacts (%d duplicate clusters merged)",
         N,
         len(consolidated_df),
         multi_clusters_count,
     )
-    return consolidated_df, N, multi_clusters_count
+    return consolidated_df, all_df, N, multi_clusters_count
 
 
 # ---------------------------------------------------------------------------
@@ -1004,7 +1063,7 @@ def main() -> None:
 
     # Step 1: Smart Deduplication & Merging
     other_file = args.other_contacts if (args.other_contacts and os.path.exists(args.other_contacts)) else None
-    contacts, total_raw, clusters_merged = smart_deduplicate_contacts(args.csv, other_file)
+    contacts, all_df, total_raw, clusters_merged = smart_deduplicate_contacts(args.csv, other_file)
 
     # Step 2: Extract all target emails from consolidated contacts
     target_emails: set[str] = set()
@@ -1034,6 +1093,74 @@ def main() -> None:
     keep = contacts[contacts["_keep"]]
     archive = contacts[~contacts["_keep"]]
 
+    # Write merge audit log ONLY for contacts that are actually KEPT in cleaned_contacts.csv
+    log_path = "merged_contacts_log.txt"
+    merge_log_lines = [
+        "=" * 80 + "\n",
+        "CONTACTS SMART MERGE AUDIT LOG (KEPT CONTACTS ONLY)\n",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+        f"Showing merged duplicate clusters for active contacts retained in cleaned_contacts.csv (--years {args.years})\n",
+        "=" * 80 + "\n\n",
+    ]
+
+    kept_clusters_count = 0
+    for _, row in keep.iterrows():
+        indices = row.get("_cluster_indices")
+        if isinstance(indices, (list, tuple)) and len(indices) > 1:
+            kept_clusters_count += 1
+            name = (
+                f"{row.get('First Name', '')} {row.get('Last Name', '')}".strip()
+                or row.get("Organization Name", "")
+                or "(no name)"
+            )
+            merge_log_lines.append("-" * 80 + "\n")
+            merge_log_lines.append(
+                f"MERGED CLUSTER #{kept_clusters_count}: '{name}' ({len(indices)} records combined)\n"
+            )
+            merge_log_lines.append("  Original records:\n")
+            for idx in indices:
+                rec = all_df.iloc[idx]
+                orig = rec.get("_origin", "main")
+                r_fn = rec.get("First Name", "").strip()
+                r_ln = rec.get("Last Name", "").strip()
+                r_org = rec.get("Organization Name", "").strip()
+                r_name = f"{r_fn} {r_ln}".strip() or r_org or "(no name)"
+                r_phones = [
+                    rec.get(f"Phone {k} - Value", "").strip()
+                    for k in range(1, 5)
+                    if rec.get(f"Phone {k} - Value", "").strip()
+                ]
+                r_emails = [
+                    rec.get(f"E-mail {k} - Value", "").strip()
+                    for k in range(1, 5)
+                    if rec.get(f"E-mail {k} - Value", "").strip()
+                ]
+                merge_log_lines.append(
+                    f"    * [{orig:5s}] Name: '{r_name}' | Phones: {r_phones} | Emails: {r_emails}\n"
+                )
+
+            m_phones = [
+                row.get(f"Phone {k} - Value", "")
+                for k in range(1, 10)
+                if row.get(f"Phone {k} - Value", "")
+            ]
+            m_emails = [
+                row.get(f"E-mail {k} - Value", "")
+                for k in range(1, 10)
+                if row.get(f"E-mail {k} - Value", "")
+            ]
+            merge_log_lines.append("  Resulting consolidated contact:\n")
+            merge_log_lines.append(
+                f"    Name:   {name}\n    Phones: {m_phones}\n    Emails: {m_emails}\n\n"
+            )
+
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.writelines(merge_log_lines)
+        log.info("Wrote audit log for kept merged contacts to %s (%d clusters)", log_path, kept_clusters_count)
+    except Exception as e:
+        log.warning("Could not write merge audit log: %s", e)
+
     # Step 6: Reporting
     print_year_breakdown(contacts)
 
@@ -1052,7 +1179,7 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    internal_cols = ["_latest_interaction", "_interaction_year", "_source", "_keep"]
+    internal_cols = ["_latest_interaction", "_interaction_year", "_source", "_keep", "_cluster_indices"]
     cleaned_path = out_dir / "cleaned_contacts.csv"
     archived_path = out_dir / "archived_contacts.csv"
 
