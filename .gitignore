@@ -17,3 +17,4 @@ contacts.csv
 *.tgz
 *.mbox
 email_interactions.json
+cleaned_contacts_part*.csv
