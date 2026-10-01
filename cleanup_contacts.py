@@ -661,6 +661,7 @@ def extract_from_messages(chat_db_path: str) -> tuple[dict[str, datetime], dict[
         FROM ZWAGROUPMEMBER gm
         JOIN ZWACHATSESSION cs ON gm.ZCHATSESSION = cs.Z_PK
         WHERE gm.ZMEMBERJID LIKE '%@s.whatsapp.net'
+          AND cs.ZCONTACTJID LIKE '%@g.us'
     ) GROUP BY jid
     """
 
