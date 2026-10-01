@@ -1,6 +1,7 @@
 # Output files
 cleaned_contacts.csv
 archived_contacts.csv
+*.vcf
 
 # Python
 __pycache__/

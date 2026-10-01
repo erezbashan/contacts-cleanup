@@ -1134,93 +1134,147 @@ def prioritize_contact_phones(
     return df
 
 
-def to_google_contacts_csv(df: pd.DataFrame) -> pd.DataFrame:
+def vcard_escape(text: str) -> str:
+    """Escape special characters for vCard 3.0 according to RFC 2426."""
+    if not text:
+        return ""
+    text = str(text)
+    text = text.replace("\\", "\\\\")
+    text = text.replace(";", "\\;")
+    text = text.replace(",", "\\,")
+    text = text.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
+    return text
+
+
+def export_to_vcard(df: pd.DataFrame, output_path: Path) -> None:
     """
-    Format contacts DataFrame into the exact official Google Contacts CSV schema.
-    Prevents fields from being dumped into the 'Notes' section during Google Contacts import.
+    Export contacts DataFrame to a standards-compliant vCard 3.0 (.vcf) file.
+    Google Contacts imports vCard files natively without column mapping heuristics,
+    guaranteeing that name, phone, email, notes, and labels land in native fields.
     """
-    rows = []
+    cards = []
     for _, r in df.iterrows():
-        row = {}
-        fn = r.get("First Name", "").strip()
-        mn = r.get("Middle Name", "").strip()
-        ln = r.get("Last Name", "").strip()
-        name_parts = [p for p in [fn, mn, ln] if p]
-        full_name = " ".join(name_parts) or r.get("Organization Name", "").strip()
+        fn_raw = str(r.get("First Name", "")).strip()
+        mn_raw = str(r.get("Middle Name", "")).strip()
+        ln_raw = str(r.get("Last Name", "")).strip()
+        org_raw = str(r.get("Organization Name", "")).strip()
+        title_raw = str(r.get("Organization Title", "")).strip()
+        dept_raw = str(r.get("Organization Department", "")).strip()
+        bday_raw = str(r.get("Birthday", "")).strip()
+        notes_raw = str(r.get("Notes", "")).strip()
+        labels_raw = str(r.get("Labels", "")).strip()
 
-        row["Name"] = full_name
-        row["Given Name"] = fn
-        row["Additional Name"] = mn
-        row["Family Name"] = ln
-        row["Yomi Name"] = ""
-        row["Given Name Yomi"] = ""
-        row["Additional Name Yomi"] = ""
-        row["Family Name Yomi"] = ""
-        row["Name Prefix"] = ""
-        row["Name Suffix"] = ""
-        row["Initials"] = ""
-        row["Nickname"] = ""
-        row["Short Name"] = ""
-        row["Maiden Name"] = ""
-        row["Birthday"] = r.get("Birthday", "").strip()
-        row["Gender"] = ""
-        row["Location"] = ""
-        row["Billing Information"] = ""
-        row["Directory Server"] = ""
-        row["Mileage"] = ""
-        row["Occupation"] = ""
-        row["Hobby"] = ""
-        row["Sensitivity"] = ""
-        row["Priority"] = ""
-        row["Subject"] = ""
-        row["Notes"] = r.get("Notes", "").strip()
-        row["Language"] = ""
-        row["Photo"] = ""
+        fn = vcard_escape(fn_raw)
+        mn = vcard_escape(mn_raw)
+        ln = vcard_escape(ln_raw)
+        prefix = vcard_escape(str(r.get("Name Prefix", "")).strip())
+        suffix = vcard_escape(str(r.get("Name Suffix", "")).strip())
 
-        # Group Membership
-        labels = r.get("Labels", "").strip() or "* myContacts"
-        row["Group Membership"] = labels
+        name_parts = [p for p in [fn_raw, mn_raw, ln_raw] if p]
+        full_name = " ".join(name_parts) or org_raw or title_raw
+        if not full_name:
+            full_name = str(r.get("E-mail 1 - Value", "")).strip() or str(r.get("Phone 1 - Value", "")).strip() or "Unnamed"
+
+        card_lines = [
+            "BEGIN:VCARD",
+            "VERSION:3.0",
+            f"FN:{vcard_escape(full_name)}",
+            f"N:{ln};{fn};{mn};{prefix};{suffix}",
+        ]
+
+        if org_raw:
+            org_val = f"{vcard_escape(org_raw)};{vcard_escape(dept_raw)}" if dept_raw else vcard_escape(org_raw)
+            card_lines.append(f"ORG:{org_val}")
+        if title_raw:
+            card_lines.append(f"TITLE:{vcard_escape(title_raw)}")
+        if bday_raw:
+            card_lines.append(f"BDAY:{vcard_escape(bday_raw)}")
+        if notes_raw:
+            card_lines.append(f"NOTE:{vcard_escape(notes_raw)}")
+        if labels_raw:
+            cats = [
+                vcard_escape(lbl.strip().lstrip("* ").strip())
+                for lbl in labels_raw.split(":::")
+                if lbl.strip() and lbl.strip() != "* Other Contacts"
+            ]
+            if cats:
+                card_lines.append(f"CATEGORIES:{','.join(cats)}")
 
         # Emails 1..10
+        email_count = 0
         for i in range(1, 11):
-            lbl_val = r.get(f"E-mail {i} - Label", "") or r.get(f"E-mail {i} - Type", "")
-            t = str(lbl_val).strip().lstrip("* ").strip() or "Other"
-            v = str(r.get(f"E-mail {i} - Value", "")).strip()
-            row[f"E-mail {i} - Type"] = t if v else ""
-            row[f"E-mail {i} - Value"] = v
+            val = str(r.get(f"E-mail {i} - Value", "")).strip()
+            lbl = str(r.get(f"E-mail {i} - Label", "")).strip()
+            if val and "@" in val:
+                email_count += 1
+                is_pref = (email_count == 1) or ("*" in lbl)
+                lbl_clean = lbl.lstrip("* ").strip().upper()
+                type_parts = ["INTERNET"]
+                if "WORK" in lbl_clean or "עבודה" in lbl_clean:
+                    type_parts.append("WORK")
+                elif "HOME" in lbl_clean or "בית" in lbl_clean:
+                    type_parts.append("HOME")
+                if is_pref:
+                    type_parts.append("PREF")
+                card_lines.append(f"EMAIL;TYPE={','.join(type_parts)}:{val}")
 
         # Phones 1..10
+        phone_count = 0
         for i in range(1, 11):
-            lbl_val = r.get(f"Phone {i} - Label", "") or r.get(f"Phone {i} - Type", "")
-            t = str(lbl_val).strip().lstrip("* ").strip() or "Mobile"
-            v = str(r.get(f"Phone {i} - Value", "")).strip()
-            row[f"Phone {i} - Type"] = t if v else ""
-            row[f"Phone {i} - Value"] = v
+            val = str(r.get(f"Phone {i} - Value", "")).strip()
+            lbl = str(r.get(f"Phone {i} - Label", "")).strip()
+            if val:
+                phone_count += 1
+                is_pref = (phone_count == 1)
+                lbl_clean = lbl.lstrip("* ").strip().upper()
+                type_parts = []
+                if any(k in lbl_clean for k in ["MOBILE", "CELL", "נייד"]):
+                    type_parts.append("CELL")
+                elif any(k in lbl_clean for k in ["WORK", "עבודה"]):
+                    type_parts.append("WORK")
+                elif any(k in lbl_clean for k in ["HOME", "בית"]):
+                    type_parts.append("HOME")
+                elif "FAX" in lbl_clean:
+                    type_parts.append("FAX")
+                elif "PAGER" in lbl_clean:
+                    type_parts.append("PAGER")
+                else:
+                    type_parts.append("VOICE")
 
-        # Organization
-        org = str(r.get("Organization Name", "")).strip()
-        title = str(r.get("Organization Title", "")).strip()
-        dept = str(r.get("Organization Department", "")).strip()
-        row["Organization 1 - Type"] = "Work" if org else ""
-        row["Organization 1 - Name"] = org
-        row["Organization 1 - Yomi Name"] = ""
-        row["Organization 1 - Title"] = title
-        row["Organization 1 - Department"] = dept
-        row["Organization 1 - Symbol"] = ""
-        row["Organization 1 - Location"] = ""
-        row["Organization 1 - Job Description"] = ""
+                if is_pref:
+                    type_parts.append("PREF")
+                card_lines.append(f"TEL;TYPE={','.join(type_parts)}:{val}")
 
         # Websites 1..3
         for i in range(1, 4):
-            lbl_val = r.get(f"Website {i} - Label", "") or r.get(f"Website {i} - Type", "")
-            t = str(lbl_val).strip().lstrip("* ").strip() or "HomePage"
-            v = str(r.get(f"Website {i} - Value", "")).strip()
-            row[f"Website {i} - Type"] = t if v else ""
-            row[f"Website {i} - Value"] = v
+            val = str(r.get(f"Website {i} - Value", "")).strip()
+            if val:
+                card_lines.append(f"URL:{val}")
 
-        rows.append(row)
+        card_lines.append("END:VCARD")
+        cards.append("\n".join(card_lines))
 
-    return pd.DataFrame(rows)
+    output_path.write_text("\n".join(cards) + "\n", encoding="utf-8")
+
+
+def format_google_contacts_csv(df: pd.DataFrame, base_cols: list[str]) -> pd.DataFrame:
+    """
+    Format contacts DataFrame into the exact Google Contacts CSV schema exported by Google Contacts.
+    Ensures column headers match Google's native CSV format (e.g. 'First Name', 'E-mail 1 - Label',
+    'Phone 1 - Label', 'Labels', 'Organization Name') to prevent Google's web importer from dumping
+    unrecognized columns into the 'Notes' field.
+    """
+    internal_cols = [c for c in df.columns if c.startswith("_")]
+    clean_df = df.drop(columns=internal_cols, errors="ignore").copy()
+
+    ordered_cols = [c for c in base_cols if c in clean_df.columns]
+    for c in clean_df.columns:
+        if c not in ordered_cols:
+            ordered_cols.append(c)
+
+    out_df = clean_df.reindex(columns=ordered_cols)
+    out_df = out_df.fillna("")
+    return out_df
 
 
 
@@ -1369,6 +1423,9 @@ def main() -> None:
     contacts = prioritize_contact_emails(contacts, email_dates)
     contacts = prioritize_contact_phones(contacts, number_dates, args.min_digits)
 
+    # Step 5c: Clean obsolete Exchange routing strings across all contacts
+    contacts["Notes"] = contacts["Notes"].apply(clean_contact_notes)
+
     keep = contacts[contacts["_keep"]]
     archive = contacts[~contacts["_keep"]]
 
@@ -1458,32 +1515,45 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    internal_cols = ["_latest_interaction", "_interaction_year", "_source", "_keep", "_cluster_indices"]
-    cleaned_path = out_dir / "cleaned_contacts.csv"
-    archived_path = out_dir / "archived_contacts.csv"
+    base_cols = list(pd.read_csv(args.csv, nrows=1, dtype=str, keep_default_na=False).columns)
 
-    keep_out = to_google_contacts_csv(keep.drop(columns=internal_cols))
-    archive_out = to_google_contacts_csv(archive.drop(columns=internal_cols))
+    cleaned_csv_path = out_dir / "cleaned_contacts.csv"
+    archived_csv_path = out_dir / "archived_contacts.csv"
+    cleaned_vcf_path = out_dir / "cleaned_contacts.vcf"
+    archived_vcf_path = out_dir / "archived_contacts.vcf"
 
-    keep_out.to_csv(cleaned_path, index=False)
-    archive_out.to_csv(archived_path, index=False)
+    keep_out = format_google_contacts_csv(keep, base_cols)
+    archive_out = format_google_contacts_csv(archive, base_cols)
+
+    keep_out.to_csv(cleaned_csv_path, index=False)
+    archive_out.to_csv(archived_csv_path, index=False)
+
+    export_to_vcard(keep_out, cleaned_vcf_path)
+    export_to_vcard(archive_out, archived_vcf_path)
 
     # Also generate split batches for convenient web import
     mid = len(keep_out) // 2
-    keep_out.iloc[:mid].to_csv(out_dir / "cleaned_contacts_part1.csv", index=False)
-    keep_out.iloc[mid:].to_csv(out_dir / "cleaned_contacts_part2.csv", index=False)
+    part1_df = keep_out.iloc[:mid]
+    part2_df = keep_out.iloc[mid:]
+
+    part1_df.to_csv(out_dir / "cleaned_contacts_part1.csv", index=False)
+    part2_df.to_csv(out_dir / "cleaned_contacts_part2.csv", index=False)
+    export_to_vcard(part1_df, out_dir / "cleaned_contacts_part1.vcf")
+    export_to_vcard(part2_df, out_dir / "cleaned_contacts_part2.vcf")
 
     log.info("")
     log.info("Files written:")
-    log.info("  %s  (%d clean, deduplicated contacts)", cleaned_path, len(keep_out))
-    log.info("  %s  (%d archived contacts)", archived_path, len(archive_out))
-    log.info("  cleaned_contacts_part1.csv (%d contacts)", len(keep_out.iloc[:mid]))
-    log.info("  cleaned_contacts_part2.csv (%d contacts)", len(keep_out.iloc[mid:]))
+    log.info("  %s  (%d clean, deduplicated contacts in Google CSV format)", cleaned_csv_path, len(keep_out))
+    log.info("  %s  (%d clean contacts in native vCard 3.0 format)", cleaned_vcf_path, len(keep_out))
+    log.info("  %s  (%d archived contacts in Google CSV format)", archived_csv_path, len(archive_out))
+    log.info("  %s  (%d archived contacts in vCard 3.0 format)", archived_vcf_path, len(archive_out))
+    log.info("  cleaned_contacts_part1.csv / .vcf (%d contacts)", len(part1_df))
+    log.info("  cleaned_contacts_part2.csv / .vcf (%d contacts)", len(part2_df))
     log.info("")
     log.info("NEXT STEPS:")
-    log.info("  1. Upload archived_contacts.csv to Google Drive for safekeeping")
+    log.info("  1. Upload archived_contacts.csv (or .vcf) to Google Drive for safekeeping")
     log.info("  2. In Google Contacts -> Select all -> Delete (in Trash for 30 days)")
-    log.info("  3. Import cleaned_contacts.csv (or part1 and part2)")
+    log.info("  3. Import cleaned_contacts.vcf (RECOMMENDED - 100%% native field mapping) or cleaned_contacts.csv")
 
 
 if __name__ == "__main__":
