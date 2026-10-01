@@ -367,6 +367,25 @@ def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
                 if lbl and lbl != "* Other Contacts":
                     merged_labels.add(lbl)
 
+    # 5. Collect legitimate websites (excluding dead fb://, google.com/profiles, sync.me)
+    unique_websites: list[tuple[str, str]] = []
+    seen_websites = set()
+    for _, r in records.iterrows():
+        for i in range(1, 4):
+            raw_val = r.get(f"Website {i} - Value", "").strip()
+            lbl = r.get(f"Website {i} - Label", "").strip() or "HomePage"
+            for val in raw_val.split(":::"):
+                val = val.strip()
+                if not val:
+                    continue
+                v_lower = val.lower()
+                # Discard dead links from defunct services:
+                if any(x in v_lower for x in ["fb://", "google.com/profiles", "plus.google.com", "sync.me/profile", "google.com/reader"]):
+                    continue
+                if v_lower not in seen_websites:
+                    seen_websites.add(v_lower)
+                    unique_websites.append((lbl, val))
+
     # Build the merged row dictionary
     merged = {c: "" for c in all_cols}
     merged["First Name"] = best_fn
@@ -386,6 +405,11 @@ def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
     for idx, (lbl, val) in enumerate(unique_emails[:10], 1):
         merged[f"E-mail {idx} - Label"] = lbl
         merged[f"E-mail {idx} - Value"] = val
+
+    # Fill legitimate websites
+    for idx, (lbl, val) in enumerate(unique_websites[:3], 1):
+        merged[f"Website {idx} - Label"] = lbl
+        merged[f"Website {idx} - Value"] = val
 
     return merged
 
@@ -964,6 +988,73 @@ def classify_contacts(
     return contacts
 
 
+def prioritize_contact_emails(
+    contacts: pd.DataFrame, email_dates: dict[str, datetime]
+) -> pd.DataFrame:
+    """
+    For each contact with emails, re-orders email fields so that:
+    1. The email with the most recent Gmail interaction date is placed at E-mail 1 (Primary).
+    2. Its label is marked with the Google Contacts primary indicator ('* ' prefix, e.g. '* Work').
+    3. Secondary emails follow in descending order of last interaction date, with plain labels.
+    """
+    df = contacts.copy()
+    reordered_count = 0
+
+    for idx in range(len(df)):
+        raw_items = []
+        for i in range(1, 11):
+            val_col = f"E-mail {i} - Value"
+            lbl_col = f"E-mail {i} - Label"
+            val = str(df.at[idx, val_col]).strip() if val_col in df.columns else ""
+            lbl = str(df.at[idx, lbl_col]).strip() if lbl_col in df.columns else ""
+            if val and "@" in val:
+                d = email_dates.get(val.lower(), datetime.min)
+                raw_items.append((val, lbl, d, len(raw_items)))
+
+        if not raw_items:
+            continue
+
+        if len(raw_items) == 1:
+            lbl = raw_items[0][1] or "Home"
+            clean_lbl = lbl.lstrip("* ").strip() or "Home"
+            if "E-mail 1 - Label" in df.columns:
+                df.at[idx, "E-mail 1 - Label"] = f"* {clean_lbl}"
+            continue
+
+        # Sort: descending by datetime, then preserve original index
+        sorted_items = sorted(raw_items, key=lambda x: (x[2], -x[3]), reverse=True)
+
+        if sorted_items[0][0] != raw_items[0][0]:
+            reordered_count += 1
+
+        for slot in range(1, 11):
+            val_col = f"E-mail {slot} - Value"
+            lbl_col = f"E-mail {slot} - Label"
+            if slot <= len(sorted_items):
+                val, lbl, _, _ = sorted_items[slot - 1]
+                clean_lbl = lbl.lstrip("* ").strip() or "Home"
+                if slot == 1:
+                    lbl_final = f"* {clean_lbl}"
+                else:
+                    lbl_final = clean_lbl
+                if val_col in df.columns:
+                    df.at[idx, val_col] = val
+                if lbl_col in df.columns:
+                    df.at[idx, lbl_col] = lbl_final
+            else:
+                if val_col in df.columns:
+                    df.at[idx, val_col] = ""
+                if lbl_col in df.columns:
+                    df.at[idx, lbl_col] = ""
+
+    log.info(
+        "Email prioritization complete: Promoted most recent email to E-mail 1 (Primary) for %d contacts",
+        reordered_count,
+    )
+    return df
+
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -1103,6 +1194,9 @@ def main() -> None:
     contacts = classify_contacts(
         contacts, number_dates, email_dates, args.min_digits, args.years
     )
+
+    # Step 5b: Reorder emails so the most recently interacted email is E-mail 1 (Primary)
+    contacts = prioritize_contact_emails(contacts, email_dates)
 
     keep = contacts[contacts["_keep"]]
     archive = contacts[~contacts["_keep"]]
