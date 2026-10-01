@@ -226,6 +226,29 @@ def are_similar_names(n1: str, n2: str) -> bool:
     return False
 
 
+def clean_contact_notes(text: str) -> str:
+    """
+    Remove obsolete Microsoft Exchange internal routing strings (X.500 distinguished names)
+    which were copied during legacy Outlook migrations and have no utility in Google Contacts.
+    """
+    if not text:
+        return ""
+    lines = text.split("\n")
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if re.search(r"Exchange E-mail Address:\s*/o=", stripped, re.IGNORECASE):
+            continue
+        if re.search(r"^/o=[^/]+/ou=", stripped, re.IGNORECASE):
+            continue
+        if "Exchange Administrative Group" in stripped:
+            continue
+        cleaned_lines.append(line)
+    cleaned = "\n".join(cleaned_lines).strip()
+    cleaned = re.sub(r"\s*\|\s*\|\s*", " | ", cleaned)
+    return cleaned.strip(" |")
+
+
 def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
     """
     Consolidate a cluster of duplicate/fragmented contact records into a single
@@ -354,7 +377,7 @@ def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
     merged_labels = set()
 
     for _, r in records.iterrows():
-        notes = r.get("Notes", "").strip()
+        notes = clean_contact_notes(r.get("Notes", "").strip())
         if notes and notes not in merged_notes:
             merged_notes.append(notes)
         bday = r.get("Birthday", "").strip()
