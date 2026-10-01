@@ -232,6 +232,10 @@ def clean_single_note_part(text: str) -> str:
     # 1. Strip legacy social network sync tags (e.g. <sn>id:.../friendof:...</sn>)
     text = re.sub(r"<sn>.*?</sn>", "", text, flags=re.DOTALL | re.IGNORECASE)
 
+    # Legacy corporate email signature (Miri Curiel Orca Interactive)
+    if "orca interactive" in text.lower() and "miri.curiel@orca" in text.lower():
+        return ""
+
     lines = text.split("\n")
     cleaned_lines = []
     skip_old_block = False
@@ -252,6 +256,21 @@ def clean_single_note_part(text: str) -> str:
         if re.match(r"^(Israeli|US)\s+Mobile:\s*", stripped, re.IGNORECASE):
             continue
         if re.match(r"^Mobile:\s*[\+\d\.\-\s]+$", stripped, re.IGNORECASE):
+            continue
+        # Item A: LinkedIn profile links in notes
+        if re.search(r"linkedin\.com", stripped, re.IGNORECASE) or re.match(r"^LinkedIn\s+Profile:\s*", stripped, re.IGNORECASE):
+            continue
+        # Item B: Hebrew keyboard layout typo
+        if stripped in ["טןכשא"]:
+            continue
+        # Item C: Redundant Email lines
+        if re.match(r"^(?:Email\s+(?:Address)?|E-mail):\s*[\w\.\-\+]+@[\w\.\-]+$", stripped, re.IGNORECASE):
+            continue
+        # Item D: Raw CSV template dumps (e.g. ', SpouseName, ...')
+        if ", SpouseName," in stripped or ", WorkPhone," in stripped:
+            prefix = re.split(r",\s*SpouseName,", stripped, flags=re.IGNORECASE)[0].strip()
+            if prefix:
+                cleaned_lines.append(prefix)
             continue
         # Obsolete archived phone number blocks in notes (e.g. 'Old:', followed by Home 770..., Mobile 404...)
         if re.match(r"^Old:\s*$", stripped, re.IGNORECASE):
@@ -408,6 +427,8 @@ def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
                 val = val.strip()
                 if val and "@" in val:
                     norm = val.lower()
+                    if "member@linkedin.com" in norm or "@reply.linkedin.com" in norm:
+                        continue
                     if norm not in seen_emails:
                         seen_emails.add(norm)
                         unique_emails.append((lbl, val))
@@ -431,7 +452,7 @@ def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
                 if lbl and lbl != "* Other Contacts":
                     merged_labels.add(lbl)
 
-    # 5. Collect legitimate websites (excluding dead fb://, google.com/profiles, sync.me)
+    # 5. Collect legitimate websites (excluding dead fb://, google.com/profiles, sync.me, linkedin.com)
     unique_websites: list[tuple[str, str]] = []
     seen_websites = set()
     for _, r in records.iterrows():
@@ -443,8 +464,8 @@ def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
                 if not val:
                     continue
                 v_lower = val.lower()
-                # Discard dead links from defunct services:
-                if any(x in v_lower for x in ["fb://", "google.com/profiles", "plus.google.com", "sync.me/profile", "google.com/reader"]):
+                # Discard dead links from defunct services and LinkedIn:
+                if any(x in v_lower for x in ["fb://", "google.com/profiles", "plus.google.com", "sync.me/profile", "google.com/reader", "linkedin.com"]):
                     continue
                 if v_lower not in seen_websites:
                     seen_websites.add(v_lower)
@@ -474,6 +495,23 @@ def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
     for idx, (lbl, val) in enumerate(unique_websites[:3], 1):
         merged[f"Website {idx} - Label"] = lbl
         merged[f"Website {idx} - Value"] = val
+
+    # Preserve Organization Title & Department
+    for _, r in records.iterrows():
+        if not merged.get("Organization Title"):
+            merged["Organization Title"] = r.get("Organization Title", "").strip()
+        if not merged.get("Organization Department"):
+            merged["Organization Department"] = r.get("Organization Department", "").strip()
+
+    # Preserve Addresses 1..3
+    for i in range(1, 4):
+        for addr_field in ["Label", "Formatted", "Street", "City", "PO Box", "Region", "Postal Code", "Country", "Extended Address"]:
+            col_name = f"Address {i} - {addr_field}"
+            if col_name in all_cols:
+                for _, r in records.iterrows():
+                    val = r.get(col_name, "").strip()
+                    if val and not merged[col_name]:
+                        merged[col_name] = val
 
     return merged
 
@@ -1286,6 +1324,22 @@ def export_to_vcard(df: pd.DataFrame, output_path: Path) -> None:
                     type_parts.append("PREF")
                 card_lines.append(f"TEL;TYPE={','.join(type_parts)}:{val}")
 
+        # Addresses 1..3
+        for i in range(1, 4):
+            street = str(r.get(f"Address {i} - Street", "")).strip()
+            city = str(r.get(f"Address {i} - City", "")).strip()
+            region = str(r.get(f"Address {i} - Region", "")).strip()
+            postcode = str(r.get(f"Address {i} - Postal Code", "")).strip()
+            country = str(r.get(f"Address {i} - Country", "")).strip()
+            pobox = str(r.get(f"Address {i} - PO Box", "")).strip()
+            lbl = str(r.get(f"Address {i} - Label", "")).strip() or "HOME"
+            if any([street, city, region, postcode, country]):
+                type_param = "WORK" if "WORK" in lbl.upper() else "HOME"
+                card_lines.append(
+                    f"ADR;TYPE={type_param}:{vcard_escape(pobox)};;{vcard_escape(street)};"
+                    f"{vcard_escape(city)};{vcard_escape(region)};{vcard_escape(postcode)};{vcard_escape(country)}"
+                )
+
         # Websites 1..3
         for i in range(1, 4):
             val = str(r.get(f"Website {i} - Value", "")).strip()
@@ -1316,6 +1370,91 @@ def format_google_contacts_csv(df: pd.DataFrame, base_cols: list[str]) -> pd.Dat
     out_df = clean_df.reindex(columns=ordered_cols)
     out_df = out_df.fillna("")
     return out_df
+
+
+def extract_addresses_from_notes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract address information from legacy Outlook CSV dumps in Notes
+    (e.g. ', SpouseName, ... WorkAddress, 81 Westwood Ave ...') into native Address fields.
+    """
+    for idx in range(len(df)):
+        notes = str(df.at[idx, "Notes"])
+        if ", WorkAddress," in notes and not str(df.at[idx, "Address 1 - Street"]).strip():
+            parts = [p.strip() for p in notes.split(",")]
+            street, city, region, postcode, country = "", "", "", "", ""
+            for i in range(len(parts) - 1):
+                k = parts[i]
+                v = parts[i + 1]
+                if k == "WorkAddress" and v:
+                    street = v
+                elif k == "WorkCity" and v:
+                    city = v
+                elif k == "WorkState" and v:
+                    region = v
+                elif k == "WorkZipCode" and v:
+                    postcode = v
+                elif k == "WorkCountry" and v:
+                    country = v
+            if street:
+                df.at[idx, "Address 1 - Label"] = "Work"
+                df.at[idx, "Address 1 - Street"] = street
+                df.at[idx, "Address 1 - City"] = city
+                df.at[idx, "Address 1 - Region"] = region
+                df.at[idx, "Address 1 - Postal Code"] = postcode
+                df.at[idx, "Address 1 - Country"] = country
+                formatted = ", ".join(
+                    [p for p in [street, f"{city} {region} {postcode}".strip(), country] if p]
+                )
+                df.at[idx, "Address 1 - Formatted"] = formatted
+    return df
+
+
+def clean_defunct_websites_and_emails(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Strip dead links (LinkedIn profile links, defunct fb://, plus.google.com, etc.)
+    from Website fields, and remove fake LinkedIn notification addresses.
+    """
+    for idx in range(len(df)):
+        # 1. Clean Websites
+        for i in range(1, 4):
+            val_col = f"Website {i} - Value"
+            lbl_col = f"Website {i} - Label"
+            val = str(df.at[idx, val_col]).strip() if val_col in df.columns else ""
+            if val:
+                kept_urls = []
+                for u in val.split(":::"):
+                    u_clean = u.strip()
+                    u_lower = u_clean.lower()
+                    if any(
+                        x in u_lower
+                        for x in [
+                            "fb://",
+                            "google.com/profiles",
+                            "plus.google.com",
+                            "sync.me/profile",
+                            "google.com/reader",
+                            "linkedin.com",
+                        ]
+                    ):
+                        continue
+                    if u_clean:
+                        kept_urls.append(u_clean)
+                df.at[idx, val_col] = " ::: ".join(kept_urls)
+                if not kept_urls and lbl_col in df.columns:
+                    df.at[idx, lbl_col] = ""
+
+        # 2. Clean fake LinkedIn notification emails
+        for i in range(1, 11):
+            val_col = f"E-mail {i} - Value"
+            lbl_col = f"E-mail {i} - Label"
+            val = str(df.at[idx, val_col]).strip() if val_col in df.columns else ""
+            if val and (
+                "member@linkedin.com" in val.lower() or "@reply.linkedin.com" in val.lower()
+            ):
+                df.at[idx, val_col] = ""
+                if lbl_col in df.columns:
+                    df.at[idx, lbl_col] = ""
+    return df
 
 
 
@@ -1464,7 +1603,13 @@ def main() -> None:
     contacts = prioritize_contact_emails(contacts, email_dates)
     contacts = prioritize_contact_phones(contacts, number_dates, args.min_digits)
 
-    # Step 5c: Clean obsolete Exchange routing strings across all contacts
+    # Step 5c: Extract native addresses from legacy CSV dump in Notes (e.g. Assaf Rudich)
+    contacts = extract_addresses_from_notes(contacts)
+
+    # Step 5d: Clean defunct websites (LinkedIn, dead Google profiles) and dummy LinkedIn emails
+    contacts = clean_defunct_websites_and_emails(contacts)
+
+    # Step 5e: Clean obsolete notes (Exchange strings, directory dumps, typos, redundant lines)
     contacts["Notes"] = contacts["Notes"].apply(clean_contact_notes)
 
     keep = contacts[contacts["_keep"]]
