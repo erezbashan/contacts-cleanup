@@ -1078,6 +1078,152 @@ def prioritize_contact_emails(
     return df
 
 
+def prioritize_contact_phones(
+    contacts: pd.DataFrame, number_dates: dict[str, datetime], min_digits: int = 7
+) -> pd.DataFrame:
+    """
+    For each contact with multiple phone numbers, re-orders phone fields so that:
+    1. The phone number with the most recent WhatsApp interaction date (messages or calls)
+       is placed at Phone 1 (Primary).
+    2. Secondary phone numbers follow in descending order of last interaction date.
+    """
+    df = contacts.copy()
+    reordered_count = 0
+
+    for idx in range(len(df)):
+        raw_items = []
+        for i in range(1, 11):
+            val_col = f"Phone {i} - Value"
+            lbl_col = f"Phone {i} - Label" if f"Phone {i} - Label" in df.columns else f"Phone {i} - Type"
+            val = str(df.at[idx, val_col]).strip() if val_col in df.columns else ""
+            lbl = str(df.at[idx, lbl_col]).strip() if lbl_col in df.columns else ""
+            if val:
+                d = normalize_phone(val)
+                dt = find_latest_phone_interaction(d, number_dates, min_digits) or datetime.min
+                raw_items.append((val, lbl, dt, len(raw_items)))
+
+        if len(raw_items) <= 1:
+            continue
+
+        # Sort: descending by interaction datetime, then preserve original index
+        sorted_items = sorted(raw_items, key=lambda x: (x[2], -x[3]), reverse=True)
+
+        if sorted_items[0][0] != raw_items[0][0]:
+            reordered_count += 1
+
+        for slot in range(1, 11):
+            val_col = f"Phone {slot} - Value"
+            lbl_col = f"Phone {slot} - Label" if f"Phone {slot} - Label" in df.columns else f"Phone {slot} - Type"
+            if slot <= len(sorted_items):
+                val, lbl, _, _ = sorted_items[slot - 1]
+                clean_lbl = lbl.lstrip("* ").strip() or "Mobile"
+                if val_col in df.columns:
+                    df.at[idx, val_col] = val
+                if lbl_col in df.columns:
+                    df.at[idx, lbl_col] = clean_lbl
+            else:
+                if val_col in df.columns:
+                    df.at[idx, val_col] = ""
+                if lbl_col in df.columns:
+                    df.at[idx, lbl_col] = ""
+
+    log.info(
+        "Phone prioritization complete: Promoted most recent WhatsApp phone to Phone 1 (Primary) for %d contacts",
+        reordered_count,
+    )
+    return df
+
+
+def to_google_contacts_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Format contacts DataFrame into the exact official Google Contacts CSV schema.
+    Prevents fields from being dumped into the 'Notes' section during Google Contacts import.
+    """
+    rows = []
+    for _, r in df.iterrows():
+        row = {}
+        fn = r.get("First Name", "").strip()
+        mn = r.get("Middle Name", "").strip()
+        ln = r.get("Last Name", "").strip()
+        name_parts = [p for p in [fn, mn, ln] if p]
+        full_name = " ".join(name_parts) or r.get("Organization Name", "").strip()
+
+        row["Name"] = full_name
+        row["Given Name"] = fn
+        row["Additional Name"] = mn
+        row["Family Name"] = ln
+        row["Yomi Name"] = ""
+        row["Given Name Yomi"] = ""
+        row["Additional Name Yomi"] = ""
+        row["Family Name Yomi"] = ""
+        row["Name Prefix"] = ""
+        row["Name Suffix"] = ""
+        row["Initials"] = ""
+        row["Nickname"] = ""
+        row["Short Name"] = ""
+        row["Maiden Name"] = ""
+        row["Birthday"] = r.get("Birthday", "").strip()
+        row["Gender"] = ""
+        row["Location"] = ""
+        row["Billing Information"] = ""
+        row["Directory Server"] = ""
+        row["Mileage"] = ""
+        row["Occupation"] = ""
+        row["Hobby"] = ""
+        row["Sensitivity"] = ""
+        row["Priority"] = ""
+        row["Subject"] = ""
+        row["Notes"] = r.get("Notes", "").strip()
+        row["Language"] = ""
+        row["Photo"] = ""
+
+        # Group Membership
+        labels = r.get("Labels", "").strip() or "* myContacts"
+        row["Group Membership"] = labels
+
+        # Emails 1..10
+        for i in range(1, 11):
+            lbl_val = r.get(f"E-mail {i} - Label", "") or r.get(f"E-mail {i} - Type", "")
+            t = str(lbl_val).strip().lstrip("* ").strip() or "Other"
+            v = str(r.get(f"E-mail {i} - Value", "")).strip()
+            row[f"E-mail {i} - Type"] = t if v else ""
+            row[f"E-mail {i} - Value"] = v
+
+        # Phones 1..10
+        for i in range(1, 11):
+            lbl_val = r.get(f"Phone {i} - Label", "") or r.get(f"Phone {i} - Type", "")
+            t = str(lbl_val).strip().lstrip("* ").strip() or "Mobile"
+            v = str(r.get(f"Phone {i} - Value", "")).strip()
+            row[f"Phone {i} - Type"] = t if v else ""
+            row[f"Phone {i} - Value"] = v
+
+        # Organization
+        org = str(r.get("Organization Name", "")).strip()
+        title = str(r.get("Organization Title", "")).strip()
+        dept = str(r.get("Organization Department", "")).strip()
+        row["Organization 1 - Type"] = "Work" if org else ""
+        row["Organization 1 - Name"] = org
+        row["Organization 1 - Yomi Name"] = ""
+        row["Organization 1 - Title"] = title
+        row["Organization 1 - Department"] = dept
+        row["Organization 1 - Symbol"] = ""
+        row["Organization 1 - Location"] = ""
+        row["Organization 1 - Job Description"] = ""
+
+        # Websites 1..3
+        for i in range(1, 4):
+            lbl_val = r.get(f"Website {i} - Label", "") or r.get(f"Website {i} - Type", "")
+            t = str(lbl_val).strip().lstrip("* ").strip() or "HomePage"
+            v = str(r.get(f"Website {i} - Value", "")).strip()
+            row[f"Website {i} - Type"] = t if v else ""
+            row[f"Website {i} - Value"] = v
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+
 
 # ---------------------------------------------------------------------------
 # Reporting
@@ -1219,8 +1365,9 @@ def main() -> None:
         contacts, number_dates, email_dates, args.min_digits, args.years
     )
 
-    # Step 5b: Reorder emails so the most recently interacted email is E-mail 1 (Primary)
+    # Step 5b: Reorder emails & phones so the most recently interacted is E-mail 1 / Phone 1 (Primary)
     contacts = prioritize_contact_emails(contacts, email_dates)
+    contacts = prioritize_contact_phones(contacts, number_dates, args.min_digits)
 
     keep = contacts[contacts["_keep"]]
     archive = contacts[~contacts["_keep"]]
@@ -1315,20 +1462,8 @@ def main() -> None:
     cleaned_path = out_dir / "cleaned_contacts.csv"
     archived_path = out_dir / "archived_contacts.csv"
 
-    # Format headers and types to standard Google Contacts import format:
-    # Google's CSV import engine expects ' - Type' (not ' - Label') and clean values (e.g. 'Work', not '* Work').
-    def format_for_google_import(df: pd.DataFrame) -> pd.DataFrame:
-        df_out = df.copy()
-        rename_map = {}
-        for c in df_out.columns:
-            if " - Label" in c:
-                new_c = c.replace(" - Label", " - Type")
-                rename_map[c] = new_c
-                df_out[c] = df_out[c].astype(str).str.lstrip("* ").str.strip()
-        return df_out.rename(columns=rename_map)
-
-    keep_out = format_for_google_import(keep.drop(columns=internal_cols))
-    archive_out = format_for_google_import(archive.drop(columns=internal_cols))
+    keep_out = to_google_contacts_csv(keep.drop(columns=internal_cols))
+    archive_out = to_google_contacts_csv(archive.drop(columns=internal_cols))
 
     keep_out.to_csv(cleaned_path, index=False)
     archive_out.to_csv(archived_path, index=False)
