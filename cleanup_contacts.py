@@ -23,8 +23,10 @@ Usage:
 """
 
 import argparse
+import base64
 from email.utils import parsedate_to_datetime
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -34,6 +36,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime, timedelta
 
 try:
@@ -54,6 +57,12 @@ WHATSAPP_CHAT_DB_PATH = os.path.expanduser(
 WHATSAPP_CALL_DB_PATH = os.path.expanduser(
     "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/CallHistory.sqlite"
 )
+
+WHATSAPP_PROFILE_DIR = os.path.expanduser(
+    "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Media/Profile"
+)
+
+PHOTO_CACHE_DIR = Path(".photo_cache")
 
 EMAIL_CACHE_FILE = "email_interactions.json"
 
@@ -513,6 +522,12 @@ def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
                     if val and not merged[col_name]:
                         merged[col_name] = val
 
+    # Preserve Google Photo URL if present
+    for _, r in records.iterrows():
+        photo_val = str(r.get("Photo", "")).strip()
+        if photo_val and photo_val.lower() != "nan" and not merged.get("Photo"):
+            merged["Photo"] = photo_val
+
     return merged
 
 
@@ -693,6 +708,8 @@ def smart_deduplicate_contacts(
         clusters.setdefault(uf.find(i), []).append(i)
 
     clean_cols = [c for c in cols if not c.startswith("_")]
+    if "Photo" in all_df.columns and "Photo" not in clean_cols:
+        clean_cols.append("Photo")
     # Ensure standard phone and email slots exist up to 5
     for i in range(1, 6):
         for prefix in ["Phone", "E-mail"]:
@@ -1225,13 +1242,152 @@ def vcard_escape(text: str) -> str:
     return text
 
 
-def export_to_vcard(df: pd.DataFrame, output_path: Path) -> None:
+def get_whatsapp_profile_photos(media_dir: str = WHATSAPP_PROFILE_DIR) -> dict[str, str]:
+    """
+    Scan WhatsApp Desktop Media/Profile directory and return a map of
+    normalized phone digits -> best image file path.
+    Prefers full-resolution .jpg (if <= 350KB) over .thumb thumbnails.
+    """
+    if not os.path.exists(media_dir):
+        return {}
+
+    files = glob.glob(os.path.join(media_dir, "*.*"))
+    phone_map: dict[str, str] = {}
+    for path in files:
+        fname = os.path.basename(path)
+        m = re.match(r"^(\d+)-", fname)
+        if not m:
+            continue
+        digits = m.group(1)
+        # Exclude very long IDs (group IDs are often 15+ digits like 120363...)
+        if len(digits) > 15:
+            continue
+        ext = os.path.splitext(fname)[1].lower()
+        if digits not in phone_map:
+            phone_map[digits] = path
+        else:
+            # Upgrade thumb to jpg if jpg is of reasonable size
+            if phone_map[digits].endswith(".thumb") and ext == ".jpg":
+                try:
+                    if os.path.getsize(path) <= 350 * 1024:
+                        phone_map[digits] = path
+                except OSError:
+                    pass
+    return phone_map
+
+
+def fetch_or_cache_google_photo(url: str, cache_dir: Path = PHOTO_CACHE_DIR) -> tuple[bytes, str] | None:
+    """
+    Download a Google Contact photo URL (or load from local disk cache).
+    Returns (image_bytes, image_type) where image_type is 'JPEG' or 'PNG'.
+    """
+    if not url or not url.startswith("http"):
+        return None
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    cached_candidates = list(cache_dir.glob(f"{url_hash}.*"))
+    if cached_candidates:
+        cached_file = cached_candidates[0]
+        data = cached_file.read_bytes()
+        img_type = "PNG" if cached_file.suffix.lower() == ".png" else "JPEG"
+        return data, img_type
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = resp.read()
+            ct = resp.headers.get("Content-Type", "")
+            img_type = "PNG" if "png" in ct.lower() or data.startswith(b"\x89PNG") else "JPEG"
+            ext = ".png" if img_type == "PNG" else ".jpg"
+            (cache_dir / f"{url_hash}{ext}").write_bytes(data)
+            return data, img_type
+    except Exception as e:
+        log.debug("Failed to download Google photo %s: %s", url, e)
+        return None
+
+
+def resolve_contact_photo(
+    row: pd.Series,
+    wa_map: dict[str, str],
+    cache_dir: Path = PHOTO_CACHE_DIR,
+) -> tuple[bytes, str, str] | None:
+    """
+    Resolve contact photo with conflict resolution:
+    1. If the contact has an existing Google Contact photo, stay with it (download/cache).
+    2. Otherwise, check if a matching WhatsApp profile photo exists.
+    Returns (photo_bytes, img_type, 'google' | 'whatsapp') or None.
+    """
+    # 1. Existing Google photo check (Priority 1: Conflict resolution)
+    google_url = str(row.get("Photo", "")).strip()
+    if google_url and google_url.lower() != "nan" and google_url.startswith("http"):
+        cached = fetch_or_cache_google_photo(google_url, cache_dir)
+        if cached:
+            return cached[0], cached[1], "google"
+
+    # 2. WhatsApp photo check (Priority 2: New photos gained)
+    cands: set[str] = set()
+    for i in range(1, 11):
+        raw_val = str(row.get(f"Phone {i} - Value", "")).strip()
+        if not raw_val or raw_val.lower() == "nan":
+            continue
+        digits = re.sub(r"\D", "", raw_val)
+        if len(digits) >= 7:
+            cands.add(digits)
+            if digits.startswith("0"):
+                cands.add("972" + digits[1:])
+            elif digits.startswith("972"):
+                cands.add("0" + digits[3:])
+            if digits.startswith("1") and len(digits) == 11:
+                cands.add(digits[1:])
+
+    for c in cands:
+        if c in wa_map:
+            wa_path = wa_map[c]
+            try:
+                data = Path(wa_path).read_bytes()
+                img_type = "PNG" if data.startswith(b"\x89PNG") else "JPEG"
+                return data, img_type, "whatsapp"
+            except OSError:
+                continue
+
+    return None
+
+
+def format_vcard_photo(photo_bytes: bytes, img_type: str = "JPEG") -> str:
+    """
+    Format photo bytes as vCard 3.0 inline base64 PHOTO property with RFC 2426 line folding.
+    """
+    b64 = base64.b64encode(photo_bytes).decode("ascii")
+    prefix = f"PHOTO;ENCODING=b;TYPE={img_type}:"
+    full_str = prefix + b64
+    lines = []
+    # Line 1 up to 75 chars
+    lines.append(full_str[:75])
+    rem = full_str[75:]
+    while rem:
+        chunk = rem[:74]  # 1 space + 74 chars = 75 chars max per continuation line
+        lines.append(" " + chunk)
+        rem = rem[74:]
+    return "\n".join(lines)
+
+
+def export_to_vcard(
+    df: pd.DataFrame,
+    output_path: Path,
+    embed_photos: bool = False,
+    wa_map: dict[str, str] | None = None,
+    cache_dir: Path | None = None,
+) -> dict[str, int]:
     """
     Export contacts DataFrame to a standards-compliant vCard 3.0 (.vcf) file.
     Google Contacts imports vCard files natively without column mapping heuristics,
     guaranteeing that name, phone, email, notes, and labels land in native fields.
+    If embed_photos is True, embeds contact photos using RFC 2426 base64 PHOTO property,
+    preserving existing Google photos first and WhatsApp profile photos second.
     """
     cards = []
+    photo_stats = {"google": 0, "whatsapp": 0, "total": 0}
+
     for _, r in df.iterrows():
         fn_raw = str(r.get("First Name", "")).strip()
         mn_raw = str(r.get("Middle Name", "")).strip()
@@ -1260,6 +1416,16 @@ def export_to_vcard(df: pd.DataFrame, output_path: Path) -> None:
             f"FN:{vcard_escape(full_name)}",
             f"N:{ln};{fn};{mn};{prefix};{suffix}",
         ]
+
+        # Embed photo if requested
+        if embed_photos and wa_map is not None:
+            photo_info = resolve_contact_photo(r, wa_map, cache_dir or PHOTO_CACHE_DIR)
+            if photo_info:
+                p_bytes, p_type, p_source = photo_info
+                photo_entry = format_vcard_photo(p_bytes, p_type)
+                card_lines.append(photo_entry)
+                photo_stats[p_source] += 1
+                photo_stats["total"] += 1
 
         if org_raw:
             org_val = f"{vcard_escape(org_raw)};{vcard_escape(dept_raw)}" if dept_raw else vcard_escape(org_raw)
@@ -1350,6 +1516,8 @@ def export_to_vcard(df: pd.DataFrame, output_path: Path) -> None:
         cards.append("\n".join(card_lines))
 
     output_path.write_text("\n".join(cards) + "\n", encoding="utf-8")
+    return photo_stats
+
 
 
 def format_google_contacts_csv(df: pd.DataFrame, base_cols: list[str]) -> pd.DataFrame:
@@ -1714,8 +1882,22 @@ def main() -> None:
     keep_out.to_csv(cleaned_csv_path, index=False)
     archive_out.to_csv(archived_csv_path, index=False)
 
+    wa_map = get_whatsapp_profile_photos()
+    log.info("WhatsApp Profile Photos: mapped %d unique phone numbers from disk cache", len(wa_map))
+
+    # Standard clean vCards (lightweight, no photos)
     export_to_vcard(keep_out, cleaned_vcf_path)
     export_to_vcard(archive_out, archived_vcf_path)
+
+    # Enhanced clean vCards with photos (Conflict resolution: Google Photos first, WhatsApp second)
+    cleaned_photos_vcf_path = out_dir / "cleaned_contacts_with_photos.vcf"
+    photo_stats = export_to_vcard(
+        keep_out,
+        cleaned_photos_vcf_path,
+        embed_photos=True,
+        wa_map=wa_map,
+        cache_dir=PHOTO_CACHE_DIR,
+    )
 
     # Also generate split batches for convenient web import
     mid = len(keep_out) // 2
@@ -1726,20 +1908,45 @@ def main() -> None:
     part2_df.to_csv(out_dir / "cleaned_contacts_part2.csv", index=False)
     export_to_vcard(part1_df, out_dir / "cleaned_contacts_part1.vcf")
     export_to_vcard(part2_df, out_dir / "cleaned_contacts_part2.vcf")
+    export_to_vcard(
+        part1_df,
+        out_dir / "cleaned_contacts_part1_with_photos.vcf",
+        embed_photos=True,
+        wa_map=wa_map,
+        cache_dir=PHOTO_CACHE_DIR,
+    )
+    export_to_vcard(
+        part2_df,
+        out_dir / "cleaned_contacts_part2_with_photos.vcf",
+        embed_photos=True,
+        wa_map=wa_map,
+        cache_dir=PHOTO_CACHE_DIR,
+    )
 
     log.info("")
     log.info("Files written:")
     log.info("  %s  (%d clean, deduplicated contacts in Google CSV format)", cleaned_csv_path, len(keep_out))
-    log.info("  %s  (%d clean contacts in native vCard 3.0 format)", cleaned_vcf_path, len(keep_out))
+    log.info("  %s  (%d clean contacts in native vCard 3.0 format without photos)", cleaned_vcf_path, len(keep_out))
+    log.info(
+        "  %s  (%d contacts, %d photos embedded: %d Google retained, %d WhatsApp added)",
+        cleaned_photos_vcf_path,
+        len(keep_out),
+        photo_stats["total"],
+        photo_stats["google"],
+        photo_stats["whatsapp"],
+    )
     log.info("  %s  (%d archived contacts in Google CSV format)", archived_csv_path, len(archive_out))
     log.info("  %s  (%d archived contacts in vCard 3.0 format)", archived_vcf_path, len(archive_out))
     log.info("  cleaned_contacts_part1.csv / .vcf (%d contacts)", len(part1_df))
     log.info("  cleaned_contacts_part2.csv / .vcf (%d contacts)", len(part2_df))
+    log.info("  cleaned_contacts_part1_with_photos.vcf (%d contacts)", len(part1_df))
+    log.info("  cleaned_contacts_part2_with_photos.vcf (%d contacts)", len(part2_df))
     log.info("")
     log.info("NEXT STEPS:")
     log.info("  1. Upload archived_contacts.csv (or .vcf) to Google Drive for safekeeping")
     log.info("  2. In Google Contacts -> Select all -> Delete (in Trash for 30 days)")
-    log.info("  3. Import cleaned_contacts.vcf (RECOMMENDED - 100%% native field mapping) or cleaned_contacts.csv")
+    log.info("  3. Import cleaned_contacts_with_photos.vcf (RECOMMENDED - includes avatars & native fields) or cleaned_contacts.vcf")
+
 
 
 if __name__ == "__main__":
