@@ -27,6 +27,7 @@ import base64
 from email.utils import parsedate_to_datetime
 import glob
 import hashlib
+import io
 import json
 import logging
 import os
@@ -38,6 +39,8 @@ import sys
 import time
 import urllib.request
 from datetime import datetime, timedelta
+
+from PIL import Image
 
 try:
     from dateutil import parser as dateutil_parser
@@ -1353,22 +1356,44 @@ def resolve_contact_photo(
     return None
 
 
-def format_vcard_photo(photo_bytes: bytes, img_type: str = "JPEG") -> str:
+def optimize_image_for_vcard(img_bytes: bytes, max_dim: int = 256, quality: int = 85) -> bytes:
     """
-    Format photo bytes as vCard 3.0 inline base64 PHOTO property with RFC 2426 line folding.
+    Ensure the image is a compact, high-quality JPEG resized to at most max_dim x max_dim.
+    Prevents oversized Base64 payloads that crash Google Contacts vCard web parser.
     """
-    b64 = base64.b64encode(photo_bytes).decode("ascii")
-    prefix = f"PHOTO;ENCODING=b;TYPE={img_type}:"
-    full_str = prefix + b64
-    lines = []
-    # Line 1 up to 75 chars
-    lines.append(full_str[:75])
-    rem = full_str[75:]
-    while rem:
-        chunk = rem[:74]  # 1 space + 74 chars = 75 chars max per continuation line
-        lines.append(" " + chunk)
-        rem = rem[74:]
-    return "\n".join(lines)
+    try:
+        im = Image.open(io.BytesIO(img_bytes))
+        if im.mode in ("RGBA", "LA", "P"):
+            rgb = Image.new("RGB", im.size, (255, 255, 255))
+            if im.mode == "RGBA":
+                rgb.paste(im, mask=im.split()[3])
+            else:
+                rgb.paste(im)
+            im = rgb
+        elif im.mode != "RGB":
+            im = im.convert("RGB")
+
+        w, h = im.size
+        if max(w, h) > max_dim:
+            im.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=quality, optimize=True)
+        return out.getvalue()
+    except Exception:
+        return img_bytes
+
+
+def format_vcard_photo(photo_bytes: bytes) -> str:
+    """
+    Format photo bytes as vCard 3.0 inline base64 PHOTO property on a single continuous line.
+    Google Contacts importer parser fails if base64 data is split across multiple lines.
+    Uses standard PHOTO;ENCODING=BASE64;TYPE=JPEG: syntax.
+    """
+    opt_bytes = optimize_image_for_vcard(photo_bytes, max_dim=256, quality=85)
+    b64 = base64.b64encode(opt_bytes).decode("ascii")
+    return f"PHOTO;ENCODING=BASE64;TYPE=JPEG:{b64}"
+
 
 
 def export_to_vcard(
@@ -1421,8 +1446,8 @@ def export_to_vcard(
         if embed_photos and wa_map is not None:
             photo_info = resolve_contact_photo(r, wa_map, cache_dir or PHOTO_CACHE_DIR)
             if photo_info:
-                p_bytes, p_type, p_source = photo_info
-                photo_entry = format_vcard_photo(p_bytes, p_type)
+                p_bytes, _, p_source = photo_info
+                photo_entry = format_vcard_photo(p_bytes)
                 card_lines.append(photo_entry)
                 photo_stats[p_source] += 1
                 photo_stats["total"] += 1
@@ -1513,9 +1538,10 @@ def export_to_vcard(
                 card_lines.append(f"URL:{val}")
 
         card_lines.append("END:VCARD")
-        cards.append("\n".join(card_lines))
+        cards.append("\r\n".join(card_lines))
 
-    output_path.write_text("\n".join(cards) + "\n", encoding="utf-8")
+    vcf_content = "\r\n".join(cards) + "\r\n"
+    output_path.write_bytes(vcf_content.encode("utf-8"))
     return photo_stats
 
 
