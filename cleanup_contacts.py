@@ -226,27 +226,60 @@ def are_similar_names(n1: str, n2: str) -> bool:
     return False
 
 
-def clean_contact_notes(text: str) -> str:
-    """
-    Remove obsolete Microsoft Exchange internal routing strings (X.500 distinguished names)
-    which were copied during legacy Outlook migrations and have no utility in Google Contacts.
-    """
+def clean_single_note_part(text: str) -> str:
     if not text:
         return ""
+    # 1. Strip legacy social network sync tags (e.g. <sn>id:.../friendof:...</sn>)
+    text = re.sub(r"<sn>.*?</sn>", "", text, flags=re.DOTALL | re.IGNORECASE)
+
     lines = text.split("\n")
     cleaned_lines = []
+    skip_old_block = False
     for line in lines:
         stripped = line.strip()
+        if not stripped:
+            continue
+        # Microsoft Exchange DN routing (X.500 distinguished names)
         if re.search(r"Exchange E-mail Address:\s*/o=", stripped, re.IGNORECASE):
             continue
         if re.search(r"^/o=[^/]+/ou=", stripped, re.IGNORECASE):
             continue
         if "Exchange Administrative Group" in stripped:
             continue
+        # Corporate directory dumps (e.g. Waze internal roster sync)
+        if re.match(r"^Group:\s*", stripped, re.IGNORECASE):
+            continue
+        if re.match(r"^(Israeli|US)\s+Mobile:\s*", stripped, re.IGNORECASE):
+            continue
+        if re.match(r"^Mobile:\s*[\+\d\.\-\s]+$", stripped, re.IGNORECASE):
+            continue
+        # Obsolete archived phone number blocks in notes (e.g. 'Old:', followed by Home 770..., Mobile 404...)
+        if re.match(r"^Old:\s*$", stripped, re.IGNORECASE):
+            skip_old_block = True
+            continue
+        if skip_old_block:
+            if re.match(r"^(Home|Mobile|Work|Tel|Phone)\s+[\d\s\-\.\+]+$", stripped, re.IGNORECASE):
+                continue
+            else:
+                skip_old_block = False
         cleaned_lines.append(line)
-    cleaned = "\n".join(cleaned_lines).strip()
-    cleaned = re.sub(r"\s*\|\s*\|\s*", " | ", cleaned)
-    return cleaned.strip(" |")
+    return "\n".join(cleaned_lines).strip()
+
+
+def clean_contact_notes(text: str) -> str:
+    """
+    Remove obsolete automated metadata from contact notes while preserving genuine user notes:
+    - Obsolete Microsoft Exchange X.500 DN routing strings
+    - Legacy corporate directory roster dumps (Group: R&D, Israeli Mobile: ...)
+    - Obsolete number blocks (Old: Home ..., Mobile ...)
+    - Old social sync tags (<sn>...</sn>)
+    """
+    if not text:
+        return ""
+    parts = str(text).split(" | ")
+    cleaned_parts = [clean_single_note_part(p) for p in parts]
+    cleaned_parts = [p for p in cleaned_parts if p]
+    return " | ".join(cleaned_parts)
 
 
 def merge_contact_cluster(records: pd.DataFrame, all_cols: list[str]) -> dict:
