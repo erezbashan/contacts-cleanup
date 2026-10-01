@@ -1315,8 +1315,20 @@ def main() -> None:
     cleaned_path = out_dir / "cleaned_contacts.csv"
     archived_path = out_dir / "archived_contacts.csv"
 
-    keep_out = keep.drop(columns=internal_cols)
-    archive_out = archive.drop(columns=internal_cols)
+    # Format headers and types to standard Google Contacts import format:
+    # Google's CSV import engine expects ' - Type' (not ' - Label') and clean values (e.g. 'Work', not '* Work').
+    def format_for_google_import(df: pd.DataFrame) -> pd.DataFrame:
+        df_out = df.copy()
+        rename_map = {}
+        for c in df_out.columns:
+            if " - Label" in c:
+                new_c = c.replace(" - Label", " - Type")
+                rename_map[c] = new_c
+                df_out[c] = df_out[c].astype(str).str.lstrip("* ").str.strip()
+        return df_out.rename(columns=rename_map)
+
+    keep_out = format_for_google_import(keep.drop(columns=internal_cols))
+    archive_out = format_for_google_import(archive.drop(columns=internal_cols))
 
     keep_out.to_csv(cleaned_path, index=False)
     archive_out.to_csv(archived_path, index=False)
