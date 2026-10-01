@@ -262,6 +262,14 @@ def clean_single_note_part(text: str) -> str:
                 continue
             else:
                 skip_old_block = False
+        # Bare phone number lines dumped into Notes (e.g. '+1 (617) 467.4325', 'Home: 6179641808')
+        digits = re.sub(r"\D", "", stripped)
+        if len(digits) >= 7 and re.match(
+            r"^(?:(Home|Mobile|Work|Tel|Phone|Fax|Main|Cell):\s*)?[\+\d\s\-\.\(\)]+$",
+            stripped,
+            re.IGNORECASE,
+        ):
+            continue
         cleaned_lines.append(line)
     return "\n".join(cleaned_lines).strip()
 
