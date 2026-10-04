@@ -21,4 +21,5 @@ email_interactions.json
 cleaned_contacts_part*.csv
 other_contacts.csv
 merged_contacts_log.txt
+translated_contacts_table.md
 .photo_cache/

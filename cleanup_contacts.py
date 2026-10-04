@@ -49,6 +49,8 @@ except ImportError:
 
 import pandas as pd
 
+from name_translation import translate_contact_names, write_translation_report
+
 # ---------------------------------------------------------------------------
 # Constants & Defaults
 # ---------------------------------------------------------------------------
@@ -1442,6 +1444,10 @@ def export_to_vcard(
             f"N:{ln};{fn};{mn};{prefix};{suffix}",
         ]
 
+        nick_raw = str(r.get("Nickname", "")).strip()
+        if nick_raw:
+            card_lines.append(f"NICKNAME:{vcard_escape(nick_raw)}")
+
         # Embed photo if requested
         if embed_photos and wa_map is not None:
             photo_info = resolve_contact_photo(r, wa_map, cache_dir or PHOTO_CACHE_DIR)
@@ -1806,6 +1812,9 @@ def main() -> None:
     # Step 5e: Clean obsolete notes (Exchange strings, directory dumps, typos, redundant lines)
     contacts["Notes"] = contacts["Notes"].apply(clean_contact_notes)
 
+    # Step 5f: Translate Israeli contact names from English to Hebrew (high confidence only)
+    contacts, translation_log = translate_contact_names(contacts)
+
     keep = contacts[contacts["_keep"]]
     archive = contacts[~contacts["_keep"]]
 
@@ -1949,8 +1958,14 @@ def main() -> None:
         cache_dir=PHOTO_CACHE_DIR,
     )
 
+    # Translation audit report for human review
+    kept_translations = [t for t in translation_log if t.get("is_keep", True)]
+    translation_table_path = out_dir / "translated_contacts_table.md"
+    write_translation_report(kept_translations, translation_table_path)
+
     log.info("")
     log.info("Files written:")
+    log.info("  %s  (%d Israeli contact names translated to Hebrew)", translation_table_path, len(kept_translations))
     log.info("  %s  (%d clean, deduplicated contacts in Google CSV format)", cleaned_csv_path, len(keep_out))
     log.info("  %s  (%d clean contacts in native vCard 3.0 format without photos)", cleaned_vcf_path, len(keep_out))
     log.info(
