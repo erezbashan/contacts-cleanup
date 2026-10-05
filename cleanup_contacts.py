@@ -1994,9 +1994,8 @@ def main() -> None:
     log.info("  cleaned_contacts_part2_with_photos.vcf (%d contacts)", len(part2_df))
     log.info("")
     log.info("NEXT STEPS:")
-    log.info("  1. Upload archived_contacts.csv (or .vcf) to Google Drive for safekeeping")
-    log.info("  2. In Google Contacts -> Select all -> Delete (in Trash for 30 days)")
-    log.info("  3. Import cleaned_contacts_with_photos.vcf (RECOMMENDED - includes avatars & native fields) or cleaned_contacts.vcf")
+    log.info("  1. In Google Contacts -> Select all -> Delete (in Trash for 30 days)")
+    log.info("  2. Import cleaned_contacts_with_photos.vcf (or part1_with_photos.vcf / part2_with_photos.vcf)")
 
 
 
