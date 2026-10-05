@@ -1035,20 +1035,69 @@ def extract_email_interactions(
 # ---------------------------------------------------------------------------
 
 
+def get_phone_match_keys(digits: str, min_digits: int = 7) -> list[str]:
+    """
+    Generate normalized lookup keys for a phone number to bridge international and local formats.
+    e.g., '0544871828' <-> '972544871828', plus suffix matches down to min_digits.
+    """
+    if not digits:
+        return []
+    keys = set()
+    if len(digits) >= min_digits:
+        keys.add(digits)
+    # Israeli local (05X...) <-> international (9725X...)
+    if digits.startswith("0") and len(digits) >= 9:
+        keys.add("972" + digits[1:])
+        keys.add(digits[1:])
+    elif digits.startswith("972") and len(digits) >= 11:
+        keys.add("0" + digits[3:])
+        keys.add(digits[3:])
+    elif digits.startswith("00972") and len(digits) >= 13:
+        keys.add("0" + digits[5:])
+        keys.add(digits[5:])
+
+    # Suffix variants for standard landline/mobile matching
+    for length in (9, 8, 7):
+        if len(digits) >= length and length >= min_digits:
+            keys.add(digits[-length:])
+
+    return [k for k in keys if len(k) >= min_digits]
+
+
+def build_phone_lookup(
+    number_dates: dict[str, datetime], min_digits: int = 7
+) -> dict[str, datetime]:
+    """
+    Pre-index phone interaction dates by all their normalized match keys for O(1) matching.
+    """
+    lookup: dict[str, datetime] = {}
+    for active_num, dt in number_dates.items():
+        if not dt:
+            continue
+        digits = re.sub(r"\D", "", str(active_num))
+        for key in get_phone_match_keys(digits, min_digits):
+            if key not in lookup or dt > lookup[key]:
+                lookup[key] = dt
+    return lookup
+
+
 def find_latest_phone_interaction(
-    contact_digits: str, number_dates: dict[str, datetime], min_digits: int
+    contact_digits: str,
+    number_dates: dict[str, datetime],
+    min_digits: int = 7,
+    phone_lookup: dict[str, datetime] | None = None,
 ) -> datetime | None:
     if not contact_digits or len(contact_digits) < min_digits:
         return None
 
+    # Use pre-built lookup if provided, or build on the fly if number_dates is passed
+    lookup = phone_lookup if phone_lookup is not None else build_phone_lookup(number_dates, min_digits)
+    keys = get_phone_match_keys(contact_digits, min_digits)
     best: datetime | None = None
-    for active, dt in number_dates.items():
-        overlap = min(len(contact_digits), len(active))
-        if overlap < min_digits:
-            continue
-        if contact_digits[-overlap:] == active[-overlap:]:
-            if best is None or dt > best:
-                best = dt
+    for k in keys:
+        dt = lookup.get(k)
+        if dt is not None and (best is None or dt > best):
+            best = dt
     return best
 
 
@@ -1065,6 +1114,7 @@ def classify_contacts(
     log.info("Matching against %d phone columns and %d email columns...", len(phone_cols), len(email_cols))
 
     cutoff = datetime.now() - timedelta(days=years * 365)
+    phone_lookup = build_phone_lookup(number_dates, min_digits)
 
     latest_dates: list[datetime | None] = []
     sources: list[str | None] = []
@@ -1074,8 +1124,10 @@ def classify_contacts(
         best_phone: datetime | None = None
         for col in phone_cols:
             val = row[col]
-            if val:
-                dt = find_latest_phone_interaction(normalize_phone(val), number_dates, min_digits)
+            if pd.notna(val) and val:
+                dt = find_latest_phone_interaction(
+                    normalize_phone(val), number_dates, min_digits, phone_lookup=phone_lookup
+                )
                 if dt is not None and (best_phone is None or dt > best_phone):
                     best_phone = dt
 
@@ -1083,8 +1135,8 @@ def classify_contacts(
         best_email: datetime | None = None
         for col in email_cols:
             val = row[col]
-            if val:
-                em = val.strip().lower()
+            if pd.notna(val) and val:
+                em = str(val).strip().lower()
                 dt = email_dates.get(em)
                 if dt is not None and (best_email is None or dt > best_email):
                     best_email = dt
@@ -1190,6 +1242,7 @@ def prioritize_contact_phones(
     """
     df = contacts.copy()
     reordered_count = 0
+    phone_lookup = build_phone_lookup(number_dates, min_digits)
 
     for idx in range(len(df)):
         raw_items = []
@@ -1200,7 +1253,12 @@ def prioritize_contact_phones(
             lbl = str(df.at[idx, lbl_col]).strip() if lbl_col in df.columns else ""
             if val:
                 d = normalize_phone(val)
-                dt = find_latest_phone_interaction(d, number_dates, min_digits) or datetime.min
+                dt = (
+                    find_latest_phone_interaction(
+                        d, number_dates, min_digits, phone_lookup=phone_lookup
+                    )
+                    or datetime.min
+                )
                 raw_items.append((val, lbl, dt, len(raw_items)))
 
         if len(raw_items) <= 1:

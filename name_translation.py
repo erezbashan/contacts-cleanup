@@ -21,6 +21,7 @@ HEB_FIRST_MAP: dict[str, str] = {
     "amit": "עמית",
     "amitay": "אמיתי",
     "ariel": "אריאל",
+    "arnon": "ארנון",
     "asaf": "אסף",
     "assaf": "אסף",
     "avi": "אבי",
