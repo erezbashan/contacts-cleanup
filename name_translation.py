@@ -418,6 +418,113 @@ ENG_LAST_MAP.update({
     "שיראי": "Shirai",
 })
 
+# Dictionary of Hebrew descriptor words and service phrases commonly used in contact names
+HEB_DESCRIPTOR_MAP: dict[str, str] = {
+    "כדורסל": "Basketball",
+    "שיפוצים": "Renovations",
+    "שירותי נקיון": "Cleaning Services",
+    "ערבית": "Arabic",
+    "צרעה": "Tzora",
+    "טויוטא": "Toyota",
+    "אינסטלטור": "Plumber",
+    "אינסטלטור ממליץ מהעוגן": "Plumber",
+    "שירותי אינסטלציה מדרג": "Plumbing",
+    "שירותי אינסטלציה": "Plumbing",
+    "יוצאים ללמוד": "Yotzim Lilmod",
+    "מזגנים מעולה מומלץ על שמוליק": "AC",
+    "מזגנים": "AC",
+    "מיזוג אוויר": "AC",
+    "טכנאי מיזוג אוויר": "AC Technician",
+    "שער": "Gate",
+    "פעמונים": "Paamonim",
+    "פיקוח וליווי פרויקטים": "Project Management",
+    "יפן": "Japan",
+    "הנגר": "Carpenter",
+    "דשא": "Lawn",
+    "מתקן דוד הזית": "Boiler Repair",
+    "דודי שמש או טל סחר ?": "Solar Boilers",
+    "תמ״א דיירים סנהדרין": "TAMA Sanhedrin",
+    "סוכן מיטב": "Meitav Agent",
+    "סוכן הביטוח שלך": "Insurance Agent",
+    "-סוכן הביטוח שלך": "Insurance Agent",
+    "פסיכולוג": "Psychologist",
+    "קבלן": "Contractor",
+    "קבלן האופק 3": "Contractor",
+    "מנהלת מוסך מאיר": "Meir Garage Manager",
+    "מוסך": "Garage",
+    "קיאקים מכמורת": "Mikhmoret Kayaks",
+    "קיאקים הרצליה": "Herzliya Kayaks",
+    "קייאקים": "Kayaks",
+    "קיאקים": "Kayaks",
+    "חיים גרר": "Towing",
+    "גרר": "Towing",
+    "שכנה אריק 6": "Neighbor",
+    "שכנה": "Neighbor",
+    "פילטר למקרר": "Fridge Filter",
+    "חשמלאי לוי": "Electrician",
+    "חשמלאי": "Electrician",
+    "השכרת מקרן": "Projector Rental",
+    "מקרן": "Projector",
+    "בואונדבר": "BoNedaber",
+    "שיננית": "Dental Hygienist",
+    "מתווך בבלי": "Realtor",
+    "מתווך": "Realtor",
+    "פאזלים": "Puzzles",
+    "רשיון אקדח שוהם": "Gun License",
+    "דיגיטל": "Digital",
+    "מחסן חלפים טויוטה": "Toyota Parts",
+    "Wooden Dreams": "Wooden Dreams",
+    "STW": "STW",
+}
+
+# Known surnames embedded inside compound descriptor notes
+KNOWN_EXTRA_SURNAMES: dict[str, str] = {
+    "סבאח": "Sabah",
+    "שנאן": "Shanan",
+    "משה": "Moshe",
+    "גור": "Gur",
+    "דויטשר": "Deutscher",
+    "רובינשטיין": "Rubinstein",
+    "אביטל": "Avital",
+    "לוינסון": "Levinson",
+    "גולדנברג": "Goldenberg",
+    "מלניק": "Melnik",
+    "רווח": "Revach",
+    "באר": "Beer",
+    "מנור": "Manor",
+    "סאיג": "Saig",
+    "להב אבנשטיין": "Lahav Evenstein",
+    "לוי": "Levy",
+    "דרוקר": "Drucker",
+    "וולאנה": "Wellana",
+}
+
+
+def translate_descriptor_part(text: str) -> str:
+    """Translate a Hebrew note or service descriptor (e.g. 'כדורסל' -> 'Basketball')."""
+    text = text.strip()
+    if not text:
+        return ""
+    if text in HEB_DESCRIPTOR_MAP:
+        return HEB_DESCRIPTOR_MAP[text]
+
+    # Check compound patterns like 'סבאח כדורסל' or 'משה ערבית'
+    for s_heb, s_eng in KNOWN_EXTRA_SURNAMES.items():
+        if s_heb in text:
+            rest = text.replace(s_heb, "").strip().strip("-").strip()
+            desc_eng = ""
+            for d_heb, d_eng in sorted(HEB_DESCRIPTOR_MAP.items(), key=lambda x: len(x[0]), reverse=True):
+                if d_heb in rest:
+                    desc_eng = d_eng
+                    break
+            return f"{s_eng} {desc_eng}".strip()
+
+    # Search for known descriptor substrings
+    for d_heb, d_eng in sorted(HEB_DESCRIPTOR_MAP.items(), key=lambda x: len(x[0]), reverse=True):
+        if d_heb in text:
+            return d_eng
+    return ""
+
 
 def is_latin_name(first: str, last: str) -> bool:
     """Return True if the name contains Latin letters and no Hebrew characters."""
@@ -503,9 +610,9 @@ def translate_contact_names(
                 "is_keep": is_keep,
             })
 
-        # Direction 2: Hebrew -> English Nickname
+        # Direction 2: Hebrew -> English Nickname (including service/role descriptors)
         elif has_hebrew_characters(fn_raw, ln_raw):
-            e_fn = ENG_FIRST_MAP.get(fn_raw)
+            e_fn = ENG_FIRST_MAP.get(fn_raw) or (fn_raw if is_latin_name(fn_raw, "") else "")
             e_ln = ENG_LAST_MAP.get(ln_raw) if ln_raw else ""
 
             eng_nick = ""
@@ -513,6 +620,14 @@ def translate_contact_names(
             if fn_raw and ln_raw and e_fn and e_ln:
                 eng_nick = f"{e_fn} {e_ln}"
                 match_type = "Full Name"
+            elif fn_raw and e_fn and ln_raw:
+                desc = translate_descriptor_part(ln_raw)
+                if desc:
+                    eng_nick = f"{e_fn} {desc}"
+                    match_type = "Name + Descriptor"
+                else:
+                    eng_nick = e_fn
+                    match_type = "First Name Only"
             elif fn_raw and e_fn:
                 eng_nick = e_fn
                 match_type = "First Name Only"
