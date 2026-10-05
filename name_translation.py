@@ -1,7 +1,8 @@
 """
-Name translation module for Israeli contacts.
-Translates Latin/English names to standard Hebrew with high confidence for contacts with Israeli phone numbers.
-Preserves original English name in the 'Nickname' field for bidirectional search.
+Name translation module for contacts.
+1. Translates Latin/English names to standard Hebrew with high confidence, preserving original English name in 'Nickname'.
+2. Translates Hebrew names to English transliterations and populates 'Nickname' for contacts with Hebrew display names,
+   allowing them to be searched with an English keyboard in WhatsApp, Spotlight, and Google Contacts.
 """
 
 from __future__ import annotations
@@ -255,20 +256,167 @@ HEB_LAST_MAP: dict[str, str] = {
     "zion": "ציון",
 }
 
+# Reverse mapping for Hebrew -> English transliterations (Title Cased)
+ENG_FIRST_MAP: dict[str, str] = {v: k.title() for k, v in HEB_FIRST_MAP.items()}
+# Add specific native Hebrew first names
+ENG_FIRST_MAP.update({
+    "אבשלום": "Avshalom",
+    "אורי": "Uri",
+    "אורן": "Oren",
+    "אורנה": "Orna",
+    "אידי": "Iddy",
+    "אייל": "Eyal",
+    "אילן": "Ilan",
+    "אילת": "Ayelet",
+    "אלון": "Alon",
+    "אלירן": "Eliran",
+    "אמיר": "Amir",
+    "אסף": "Assaf",
+    "אסתי": "Esti",
+    "אפרת": "Efrat",
+    "בועז": "Boaz",
+    "בני": "Benny",
+    "ברוך": "Baruch",
+    "ברק": "Barak",
+    "גולן": "Golan",
+    "גיא": "Guy",
+    "גלית": "Galit",
+    "גלעד": "Gilad",
+    "דורון": "Doron",
+    "דניאל": "Daniel",
+    "זואי": "Zoe",
+    "זיו": "Ziv",
+    "חביבה": "Haviva",
+    "חגי": "Hagai",
+    "חי": "Hai",
+    "חנה": "Hana",
+    "טיראן": "Tiran",
+    "טל": "Tal",
+    "יגאל": "Yigal",
+    "יהודה": "Yehuda",
+    "יוכי": "Yochi",
+    "יוסי": "Yossi",
+    "יוסף": "Yosef",
+    "יניב": "Yaniv",
+    "יעל": "Yael",
+    "יעקב": "Yaacov",
+    "יערה": "Yaara",
+    "יערי": "Yaari",
+    "ירדן": "Yarden",
+    "ירון": "Yaron",
+    "ישראל": "Israel",
+    "ליאור": "Lior",
+    "לימור": "Limor",
+    "מוריה": "Moria",
+    "מיכאל": "Michael",
+    "מירי": "Miri",
+    "מני": "Meny",
+    "מתן": "Matan",
+    "נורית": "Nurit",
+    "נטלי": "Natali",
+    "ניר": "Nir",
+    "נמרוד": "Nimrod",
+    "נתי": "Nati",
+    "סהר": "Sahar",
+    "סיגל": "Sigal",
+    "סמדר": "Smadar",
+    "עדיאל": "Adiel",
+    "עדינה": "Adina",
+    "עומר": "Omer",
+    "עומרי": "Omri",
+    "עזריה": "Azaria",
+    "עמוס": "Amos",
+    "עמית": "Amit",
+    "עמרי": "Omri",
+    "ענבל": "Inbal",
+    "עפרי": "Ofri",
+    "ערן": "Eran",
+    "פנינה": "Pnina",
+    "צביקה": "Tzvika",
+    "צחי": "Tsahi",
+    "ציפי": "Tzipi",
+    "קובי": "Kobi",
+    "קרני": "Karni",
+    "רביב": "Raviv",
+    "רון": "Ron",
+    "רונן": "Ronen",
+    "רועי": "Roi",
+    "רות": "Ruth",
+    "ריטה": "Rita",
+    "רן": "Ran",
+    "שגיב": "Sagiv",
+    "שחר": "Shahar",
+    "שי": "Shai",
+    "שיר": "Shir",
+    "שלומי": "Shlomi",
+    "שלומית": "Shlomit",
+    "שלמה": "Shlomo",
+    "שמואל": "Shmuel",
+    "שמעון": "Shimon",
+    "תום": "Tom",
+    "תומר": "Tomer",
+    "תמי": "Tami",
+    "תמר": "Tamar",
+})
 
-def has_israeli_phone_number(row: pd.Series, phone_cols: list[str]) -> bool:
-    """Check if the contact has any Israeli phone number (+972 or local 05x, 0[2-9]x)."""
-    for col in phone_cols:
-        val = str(row.get(col, ""))
-        if val and val != "nan":
-            digits = re.sub(r"\D", "", val)
-            if digits.startswith("972"):
-                return True
-            if len(digits) in (9, 10) and digits.startswith("05"):
-                return True
-            if len(digits) == 9 and re.match(r"^0[23489]", digits):
-                return True
-    return False
+# Reverse mapping for Hebrew -> English last names (Title Cased)
+ENG_LAST_MAP: dict[str, str] = {v: k.title() for k, v in HEB_LAST_MAP.items()}
+# Add specific native Hebrew last names
+ENG_LAST_MAP.update({
+    "אגוזי": "Egozi",
+    "אופק": "Ofek",
+    "אורנשטיין": "Orenstein",
+    "איזינגר": "Eisinger",
+    "אלרום": "Elrom",
+    "בורוכוב": "Borochov",
+    "בז'רנו": "Bejerano",
+    "בירנבאום": "Birnbaum",
+    "בן דרור": "Ben Dror",
+    "בן חמו": "Ben Hamo",
+    "בן יוסף": "Ben Yosef",
+    "בר": "Bar",
+    "גבריאל": "Gabriel",
+    "גדות": "Gadot",
+    "גולדין": "Goldin",
+    "גור": "Gur",
+    "גילאור": "Gilor",
+    "גלאור": "Galor",
+    "גרבר": "Gerber",
+    "דוד": "David",
+    "הרצג": "Herzog",
+    "ויזניצר": "Viznitzer",
+    "וייזל": "Weisel",
+    "וייסר": "Weisser",
+    "וינר": "Weiner",
+    "זגורי": "Zaguri",
+    "זלמנוב": "Zalmanov",
+    "טל": "Tal",
+    "יוסף": "Yosef",
+    "יצחקי": "Itzhaki",
+    "כהן": "Cohen",
+    "כהנא": "Kahana",
+    "כידן": "Kidan",
+    "לגיל": "Lagil",
+    "לוינסון": "Levinson",
+    "מגידס": "Megides",
+    "מרוז": "Meroz",
+    "מרטון": "Marton",
+    "סייף": "Seif",
+    "סמט": "Semet",
+    "סרי": "Sari",
+    "פוסטולסקי": "Postolsky",
+    "פרצק": "Partzok",
+    "צובארי": "Tzuberi",
+    "קורן": "Koren",
+    "קצב": "Katzav",
+    "קציר": "Katzir",
+    "קריסטל": "Crystal",
+    "רויז": "Royz",
+    "רם": "Ram",
+    "שחר": "Shahar",
+    "שליט": "Shalit",
+    "שיראי": "Shirai",
+})
 
 
 def is_latin_name(first: str, last: str) -> bool:
@@ -281,95 +429,156 @@ def is_latin_name(first: str, last: str) -> bool:
     return has_lat and not has_heb
 
 
+def has_hebrew_characters(first: str, last: str) -> bool:
+    """Return True if the name contains Hebrew characters."""
+    full = f"{first} {last}".strip()
+    return any("\u0590" <= ch <= "\u05FF" for ch in full)
+
+
 def translate_contact_names(
     df: pd.DataFrame,
-) -> tuple[pd.DataFrame, list[dict[str, str]]]:
+) -> tuple[pd.DataFrame, dict[str, list[dict[str, str]]]]:
     """
-    Translates English names of Israeli contacts to standard Hebrew with high confidence.
-    Preserves original English name in 'Nickname' field so dual English/Hebrew search works natively.
-    Returns modified DataFrame and audit list of all translations made.
+    Bidirectional translation:
+    1. English -> Hebrew: Translates English names to standard Hebrew with high confidence,
+       preserving the original English name in the 'Nickname' field.
+    2. Hebrew -> English Nickname: For contacts with Hebrew display names, translates their
+       name to English transliteration and sets it as 'Nickname' (if Nickname is empty),
+       enabling English keyboard searches in WhatsApp, Spotlight, and Google Contacts.
+    Returns:
+        (modified_df, {
+            "english_to_hebrew": [...],
+            "hebrew_to_english_nickname": [...]
+        })
     """
     df = df.copy()
-    phone_cols = [c for c in df.columns if "Phone" in c and "Value" in c]
-    translation_log: list[dict[str, str]] = []
+    e2h_log: list[dict[str, str]] = []
+    h2e_log: list[dict[str, str]] = []
 
     for idx, row in df.iterrows():
-        if not has_israeli_phone_number(row, phone_cols):
-            continue
-
         fn_raw = str(row.get("First Name", "")).strip() if pd.notna(row.get("First Name")) else ""
         ln_raw = str(row.get("Last Name", "")).strip() if pd.notna(row.get("Last Name")) else ""
-
-        if not is_latin_name(fn_raw, ln_raw):
-            continue
-
-        # Check inverted name pattern: e.g. "Storfer" (First) "Dalia" (Last)
-        if fn_raw.lower() == "storfer" and ln_raw.lower() == "dalia":
-            heb_first = "דליה"
-            heb_last = "שטורפר"
-        else:
-            h_fn = HEB_FIRST_MAP.get(fn_raw.lower())
-            h_ln = HEB_LAST_MAP.get(ln_raw.lower()) if ln_raw else ""
-
-            # Only translate if full name is recognized with high confidence
-            if fn_raw and ln_raw and h_fn and h_ln:
-                heb_first = h_fn
-                heb_last = h_ln
-            elif fn_raw and not ln_raw and h_fn:
-                heb_first = h_fn
-                heb_last = ""
-            else:
-                continue
-
-        orig_full = f"{fn_raw} {ln_raw}".strip()
-        heb_full = f"{heb_first} {heb_last}".strip()
-
-        # Preserve English full name in Nickname if Nickname is empty
         curr_nick = str(row.get("Nickname", "")).strip() if pd.notna(row.get("Nickname")) else ""
-        if not curr_nick:
-            df.at[idx, "Nickname"] = orig_full
-
-        df.at[idx, "First Name"] = heb_first
-        df.at[idx, "Last Name"] = heb_last
-
         p1 = str(row.get("Phone 1 - Value", "")).strip() if pd.notna(row.get("Phone 1 - Value")) else ""
         org = str(row.get("Organization Name", "")).strip() if pd.notna(row.get("Organization Name")) else ""
         is_keep = bool(row.get("_keep", True))
 
-        translation_log.append({
-            "original_name": orig_full,
-            "translated_name": heb_full,
-            "heb_first": heb_first,
-            "heb_last": heb_last,
-            "phone": p1,
-            "org": org,
-            "is_keep": is_keep,
-        })
+        # Direction 1: English -> Hebrew
+        if is_latin_name(fn_raw, ln_raw):
+            # Check inverted name pattern: e.g. "Storfer" (First) "Dalia" (Last)
+            if fn_raw.lower() == "storfer" and ln_raw.lower() == "dalia":
+                heb_first = "דליה"
+                heb_last = "שטורפר"
+            else:
+                h_fn = HEB_FIRST_MAP.get(fn_raw.lower())
+                h_ln = HEB_LAST_MAP.get(ln_raw.lower()) if ln_raw else ""
 
-    return df, translation_log
+                # Only translate if recognized with high confidence
+                if fn_raw and ln_raw and h_fn and h_ln:
+                    heb_first = h_fn
+                    heb_last = h_ln
+                elif fn_raw and not ln_raw and h_fn:
+                    heb_first = h_fn
+                    heb_last = ""
+                else:
+                    continue
+
+            orig_full = f"{fn_raw} {ln_raw}".strip()
+            heb_full = f"{heb_first} {heb_last}".strip()
+
+            # Preserve original English full name in Nickname
+            if not curr_nick:
+                df.at[idx, "Nickname"] = orig_full
+
+            df.at[idx, "First Name"] = heb_first
+            df.at[idx, "Last Name"] = heb_last
+
+            e2h_log.append({
+                "original_name": orig_full,
+                "translated_name": heb_full,
+                "heb_first": heb_first,
+                "heb_last": heb_last,
+                "phone": p1,
+                "org": org,
+                "is_keep": is_keep,
+            })
+
+        # Direction 2: Hebrew -> English Nickname
+        elif has_hebrew_characters(fn_raw, ln_raw):
+            e_fn = ENG_FIRST_MAP.get(fn_raw)
+            e_ln = ENG_LAST_MAP.get(ln_raw) if ln_raw else ""
+
+            eng_nick = ""
+            match_type = ""
+            if fn_raw and ln_raw and e_fn and e_ln:
+                eng_nick = f"{e_fn} {e_ln}"
+                match_type = "Full Name"
+            elif fn_raw and e_fn:
+                eng_nick = e_fn
+                match_type = "First Name Only"
+
+            if eng_nick and not curr_nick:
+                df.at[idx, "Nickname"] = eng_nick
+                h2e_log.append({
+                    "hebrew_name": f"{fn_raw} {ln_raw}".strip(),
+                    "english_nickname": eng_nick,
+                    "match_type": match_type,
+                    "phone": p1,
+                    "org": org,
+                    "is_keep": is_keep,
+                })
+
+    return df, {
+        "english_to_hebrew": e2h_log,
+        "hebrew_to_english_nickname": h2e_log,
+    }
 
 
 def write_translation_report(
-    translations: list[dict[str, str]],
+    results: dict[str, list[dict[str, str]]],
     output_path: Path,
 ) -> None:
-    """Write a formatted Markdown table of all name translations for human review."""
+    """Write a formatted Markdown document of all name translations and nicknames for human review."""
+    e2h = results.get("english_to_hebrew", [])
+    h2e = results.get("hebrew_to_english_nickname", [])
+
     lines = [
-        "# Contact Name Translations (English → Hebrew)\n",
-        f"Total contacts translated with high confidence: **{len(translations)}**\n",
-        "> **Note:** The original English name has been preserved in the `Nickname` field ",
-        "> of each contact to ensure phone dialer, Spotlight, and WhatsApp search continue to work in English.\n",
+        "# Contact Name Translations & Nickname Mapping\n",
+        f"- English → Hebrew display name translations: **{len(e2h)}**",
+        f"- Hebrew → English search nicknames added: **{len(h2e)}**\n",
+        "> **Note:** English names are stored in the `Nickname` field of contacts so that ",
+        "> phone dialers, Apple Spotlight, WhatsApp, and Google Contacts can search in English.\n",
+        "\n",
+        "## 1. English → Hebrew Translations (Display Name Changed)\n",
+        "The following contacts had their display names converted from English to Hebrew with high confidence, ",
+        "and their original English name preserved in `Nickname`:\n",
         "\n",
         "| # | Original English Name | Translated Hebrew Name | Primary Phone | Organization |",
         "|---|---|---|---|---|",
     ]
 
-    for i, t in enumerate(translations, 1):
+    for i, t in enumerate(e2h, 1):
         orig = t["original_name"]
         heb = t["translated_name"]
         phone = t["phone"]
         org = t["org"] or "—"
         lines.append(f"| {i} | {orig} | {heb} | {phone} | {org} |")
+
+    lines.append("\n\n## 2. Hebrew Contacts Given English Nicknames\n")
+    lines.append(
+        "The following Hebrew contacts retained their Hebrew display names, while an English transliteration "
+        "was added to their `Nickname` field so you can find them by typing in English:\n\n"
+    )
+    lines.append("| # | Hebrew Display Name | Added English Nickname | Match Type | Primary Phone | Organization |")
+    lines.append("|---|---|---|---|---|---|")
+
+    for i, t in enumerate(h2e, 1):
+        heb = t["hebrew_name"]
+        eng = t["english_nickname"]
+        mtype = t["match_type"]
+        phone = t["phone"]
+        org = t["org"] or "—"
+        lines.append(f"| {i} | {heb} | {eng} | {mtype} | {phone} | {org} |")
 
     lines.append("")
     output_path.write_text("\n".join(lines), encoding="utf-8")
