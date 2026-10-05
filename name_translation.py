@@ -527,9 +527,9 @@ def translate_descriptor_part(text: str) -> str:
     return ""
 
 
-def is_latin_name(first: str, last: str) -> bool:
+def is_latin_name(first: str, last: str, middle: str = "") -> bool:
     """Return True if the name contains Latin letters and no Hebrew characters."""
-    full = f"{first} {last}".strip()
+    full = f"{first} {middle} {last}".strip()
     if not full:
         return False
     has_heb = any("\u0590" <= ch <= "\u05FF" for ch in full)
@@ -537,9 +537,9 @@ def is_latin_name(first: str, last: str) -> bool:
     return has_lat and not has_heb
 
 
-def has_hebrew_characters(first: str, last: str) -> bool:
+def has_hebrew_characters(first: str, last: str, middle: str = "") -> bool:
     """Return True if the name contains Hebrew characters."""
-    full = f"{first} {last}".strip()
+    full = f"{first} {middle} {last}".strip()
     return any("\u0590" <= ch <= "\u05FF" for ch in full)
 
 
@@ -565,6 +565,9 @@ def translate_contact_names(
 
     for idx, row in df.iterrows():
         fn_raw = str(row.get("First Name", "")).strip() if pd.notna(row.get("First Name")) else ""
+        mn_raw = str(row.get("Middle Name", "")).strip() if pd.notna(row.get("Middle Name")) else ""
+        if mn_raw.lower() == "nan":
+            mn_raw = ""
         ln_raw = str(row.get("Last Name", "")).strip() if pd.notna(row.get("Last Name")) else ""
         curr_nick = str(row.get("Nickname", "")).strip() if pd.notna(row.get("Nickname")) else ""
         p1 = str(row.get("Phone 1 - Value", "")).strip() if pd.notna(row.get("Phone 1 - Value")) else ""
@@ -572,71 +575,109 @@ def translate_contact_names(
         is_keep = bool(row.get("_keep", True))
 
         # Direction 1: English -> Hebrew
-        if is_latin_name(fn_raw, ln_raw):
+        if is_latin_name(fn_raw, ln_raw, mn_raw):
             # Check inverted name pattern: e.g. "Storfer" (First) "Dalia" (Last)
             if fn_raw.lower() == "storfer" and ln_raw.lower() == "dalia":
                 heb_first = "דליה"
+                heb_middle = ""
                 heb_last = "שטורפר"
             else:
                 h_fn = HEB_FIRST_MAP.get(fn_raw.lower())
+                h_mn = (
+                    HEB_FIRST_MAP.get(mn_raw.lower())
+                    or HEB_LAST_MAP.get(mn_raw.lower())
+                    if mn_raw
+                    else ""
+                )
                 h_ln = HEB_LAST_MAP.get(ln_raw.lower()) if ln_raw else ""
 
                 # Only translate if recognized with high confidence
-                if fn_raw and ln_raw and h_fn and h_ln:
+                if fn_raw and ln_raw and mn_raw and h_fn and h_mn and h_ln:
                     heb_first = h_fn
+                    heb_middle = h_mn
                     heb_last = h_ln
-                elif fn_raw and not ln_raw and h_fn:
+                elif fn_raw and ln_raw and not mn_raw and h_fn and h_ln:
                     heb_first = h_fn
+                    heb_middle = ""
+                    heb_last = h_ln
+                elif fn_raw and not ln_raw and not mn_raw and h_fn:
+                    heb_first = h_fn
+                    heb_middle = ""
                     heb_last = ""
                 else:
                     continue
 
-            orig_full = f"{fn_raw} {ln_raw}".strip()
-            heb_full = f"{heb_first} {heb_last}".strip()
+            name_parts_orig = [p for p in [fn_raw, mn_raw, ln_raw] if p]
+            orig_full = " ".join(name_parts_orig).strip()
+            name_parts_heb = [p for p in [heb_first, heb_middle, heb_last] if p]
+            heb_full = " ".join(name_parts_heb).strip()
 
             # Preserve original English full name in Nickname
             if not curr_nick:
                 df.at[idx, "Nickname"] = orig_full
 
             df.at[idx, "First Name"] = heb_first
+            if mn_raw:
+                df.at[idx, "Middle Name"] = heb_middle
             df.at[idx, "Last Name"] = heb_last
 
             e2h_log.append({
                 "original_name": orig_full,
                 "translated_name": heb_full,
                 "heb_first": heb_first,
+                "heb_middle": heb_middle,
                 "heb_last": heb_last,
                 "phone": p1,
                 "org": org,
                 "is_keep": is_keep,
             })
 
-        # Direction 2: Hebrew -> English Nickname (including service/role descriptors)
-        elif has_hebrew_characters(fn_raw, ln_raw):
+        # Direction 2: Hebrew -> English Nickname (including Middle Name & service/role descriptors)
+        elif has_hebrew_characters(fn_raw, ln_raw, mn_raw):
             e_fn = ENG_FIRST_MAP.get(fn_raw) or (fn_raw if is_latin_name(fn_raw, "") else "")
+            e_mn = (
+                ENG_FIRST_MAP.get(mn_raw)
+                or ENG_LAST_MAP.get(mn_raw)
+                or translate_descriptor_part(mn_raw)
+                or (mn_raw if is_latin_name(mn_raw, "") else "")
+                if mn_raw
+                else ""
+            )
             e_ln = ENG_LAST_MAP.get(ln_raw) if ln_raw else ""
 
             eng_nick = ""
             match_type = ""
-            if fn_raw and ln_raw and e_fn and e_ln:
-                eng_nick = f"{e_fn} {e_ln}"
+            if fn_raw and mn_raw and ln_raw and e_fn and e_mn and e_ln:
+                eng_nick = f"{e_fn} {e_mn} {e_ln}"
+                match_type = "Full Name (with Middle)"
+            elif fn_raw and mn_raw and ln_raw and e_fn and e_mn:
+                desc = translate_descriptor_part(ln_raw)
+                if desc:
+                    eng_nick = f"{e_fn} {e_mn} {desc}"
+                    match_type = "Name + Middle + Descriptor"
+                else:
+                    eng_nick = f"{e_fn} {e_mn}"
+                    match_type = "First + Middle Name"
+            elif fn_raw and ln_raw and e_fn and e_ln:
+                eng_nick = f"{e_fn} {e_mn} {e_ln}" if e_mn else f"{e_fn} {e_ln}"
                 match_type = "Full Name"
             elif fn_raw and e_fn and ln_raw:
                 desc = translate_descriptor_part(ln_raw)
                 if desc:
-                    eng_nick = f"{e_fn} {desc}"
+                    eng_nick = f"{e_fn} {e_mn} {desc}" if e_mn else f"{e_fn} {desc}"
                     match_type = "Name + Descriptor"
                 else:
-                    eng_nick = e_fn
+                    eng_nick = f"{e_fn} {e_mn}".strip() if e_mn else e_fn
                     match_type = "First Name Only"
             elif fn_raw and e_fn:
-                eng_nick = e_fn
+                eng_nick = f"{e_fn} {e_mn}".strip() if e_mn else e_fn
                 match_type = "First Name Only"
 
             if eng_nick and not curr_nick:
                 df.at[idx, "Nickname"] = eng_nick
+                raw_full = " ".join([p for p in [fn_raw, mn_raw, ln_raw] if p]).strip()
                 h2e_log.append({
-                    "hebrew_name": f"{fn_raw} {ln_raw}".strip(),
+                    "hebrew_name": raw_full,
                     "english_nickname": eng_nick,
                     "match_type": match_type,
                     "phone": p1,
